@@ -610,24 +610,82 @@ class SaverLoggerTest(unittest.TestCase):
                         'auto-backup must create the backup folder if missing')
 
 
-# Burp ITool flag constants used by the simulated session
-TOOL_PROXY = 4
-TOOL_SCANNER = 16
-TOOL_INTRUDER = 32
-TOOL_REPEATER = 64
+# Burp ITool flag constants -> display names, for the simulated session
+SESSION_TOOLS = [
+    (4, 'Proxy'), (8, 'Spider'), (16, 'Scanner'), (32, 'Intruder'),
+    (64, 'Repeater'), (128, 'Sequencer'), (1024, 'Extender'),
+]
+SESSION_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']
+SESSION_STATUSES = [200, 201, 204, 301, 302, 400, 401, 403, 404, 500, 503]
+
+# Repeated (path, insertion-point count) pairs so per-URL request counts build
+# up over the session. Full URLs repeat exactly, so the URL column matches.
+SESSION_URLS = [
+    ('/', 0),
+    ('/login?next=/home', 2),
+    ('/search?q=test', 1),
+    ('/cart', 0),
+    ('/api/users?id=1', 1),
+    ('/api/orders?id=1&status=open', 2),
+    ('/products?category=books', 1),
+    ('/checkout', 3),
+    ('/account/settings', 0),
+    ('/api/cart/items?id=42', 1),
+]
+TIMESTAMP_RE = re.compile(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$')
+
+# Column indexes in a logged row / exported CSV line
+C_SERIAL, C_HOST, C_METHOD, C_URL, C_STATUS = 0, 1, 2, 3, 4
+C_TOOL, C_COUNT, C_INSERTION, C_START, C_END = 5, 6, 7, 8, 9
+
+
+class Transaction(object):
+    """One request/response pair in the simulated session, carrying both the
+    mock message and the values its logged row must contain."""
+
+    def __init__(self, url, host, method, tool_flag, tool_name,
+                 params, status, kind='normal'):
+        payload = 'MALFORMED' if kind == 'malformed' else 'RESPONSE-BYTES'
+        self.msg = MockMessage(url, host=host, method=method,
+                               param_count=params, status=status,
+                               response_payload=payload)
+        self.url = url
+        self.host = host
+        self.method = method
+        self.tool_flag = tool_flag
+        self.tool_name = tool_name
+        self.params = params
+        self.status = status
+        self.kind = kind          # 'normal' | 'dropped' | 'malformed'
+        self.formula_host = False  # set for the CSV-injection case
+
+    @property
+    def expected_status(self):
+        if self.kind == 'dropped':
+            return '-'
+        if self.kind == 'malformed':
+            return 'Error'
+        return str(self.status)
 
 
 class EndToEndSessionTest(unittest.TestCase):
-    """Drive a realistic multi-tool Burp session through the real public
-    entry point (processHttpMessage -> queue -> background worker) and verify
-    that every message is logged and exported correctly.
+    """Drive a large, realistic multi-tool Burp session through the real
+    public entry point (processHttpMessage -> queue -> background worker) and
+    verify every logged row and every exported CSV line, one at a time.
 
-    The session mixes tools, sequential and concurrent in-flight requests,
-    out-of-order responses, repeated URLs, a comma-bearing URL, a dropped
-    connection (no response body), and an unparseable response. Because it
-    asserts correct correlation and CSV integrity, it is red on main and
-    green once all fix branches are applied - a single check that the whole
-    system works together.
+    The session spans all seven tools, every HTTP method, a wide range of
+    status codes, ~70 transactions delivered sequentially, in concurrent
+    batches, and fully concurrently (all in flight at once) with out-of-order
+    responses, repeated URLs whose request counts build up, URLs bearing
+    commas / semicolons / quotes / non-ASCII, a host crafted for CSV formula
+    injection, dropped connections ('-' status) and unparseable responses
+    ('Error' status). It also checkpoints a mid-session backup and, after a
+    Clear Logs, runs a fresh session to confirm state resets cleanly while
+    on-disk exports survive.
+
+    Because it verifies correlation and CSV integrity for every single row,
+    it is red on main and green only once every fix branch is applied - one
+    check that the whole system works together.
     """
 
     def setUp(self):
@@ -642,13 +700,47 @@ class EndToEndSessionTest(unittest.TestCase):
             self.ext.worker_thread.join(2000)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _feed(self, events):
-        """Deliver (toolFlag, is_request, message) events in order, exactly
-        as Burp's IHttpListener would call the extension."""
-        for tool, is_request, msg in events:
-            self.ext.processHttpMessage(tool, is_request, msg)
+    # ---------- delivery helpers ---------- #
 
-    def _await_rows(self, expected, timeout=8):
+    def _send_request(self, txn):
+        self.ext.processHttpMessage(txn.tool_flag, True, txn.msg)
+
+    def _send_response(self, txn):
+        # A dropped connection fires a response event with no body.
+        txn.msg._responded = (txn.kind != 'dropped')
+        self.ext.processHttpMessage(txn.tool_flag, False, txn.msg)
+
+    def _deliver(self, txns, mode):
+        """Deliver a phase of transactions. Responses are always enqueued in
+        list order, so serial numbers follow the master transaction order
+        regardless of how requests are interleaved.
+
+        mode 'sequential'  - request then response, one at a time
+             'batched'     - batches of 5: all requests (scrambled), then
+                             all responses (in order) => out-of-order arrival
+             'concurrent'  - all requests first (every txn in flight at once),
+                             then all responses in order
+        """
+        if mode == 'sequential':
+            for txn in txns:
+                self._send_request(txn)
+                self._send_response(txn)
+        elif mode == 'batched':
+            for start in range(0, len(txns), 5):
+                batch = txns[start:start + 5]
+                for txn in reversed(batch):
+                    self._send_request(txn)
+                for txn in batch:
+                    self._send_response(txn)
+        elif mode == 'concurrent':
+            for txn in txns:
+                self._send_request(txn)
+            for txn in txns:
+                self._send_response(txn)
+        else:
+            raise ValueError('unknown delivery mode: %s' % mode)
+
+    def _await_rows(self, expected, timeout=15):
         deadline = time.time() + timeout
         while time.time() < deadline:
             self.ext.data_lock.lock()
@@ -661,95 +753,224 @@ class EndToEndSessionTest(unittest.TestCase):
         self.fail('session logged %d/%d rows before timeout' %
                   (len(self.ext.log_data), expected))
 
-    def test_full_session_is_logged_and_exported_correctly(self):
-        # --- build the messages of the session ---
-        p1 = MockMessage('https://ginandjuice.shop/home', method='GET',
-                         param_count=0, status=200)
-        p2 = MockMessage('https://ginandjuice.shop/home', method='GET',
-                         param_count=0, status=200)           # repeat of /home
-        r1 = MockMessage('https://ginandjuice.shop/login', method='POST',
-                         param_count=2, status=302)
-        r2 = MockMessage('https://ginandjuice.shop/login', method='POST',
-                         param_count=2, status=401)           # repeat of /login
-        s1 = MockMessage('https://ginandjuice.shop/search?q=1,2', method='GET',
-                         param_count=1, status=200)           # comma in URL
-        i1 = MockMessage('https://ginandjuice.shop/item?id=1', method='GET',
-                         param_count=1, status=500)
-        x1 = MockMessage('https://ginandjuice.shop/timeout', method='GET',
-                         param_count=0, status=200)           # dropped: no body
-        e1 = MockMessage('https://ginandjuice.shop/error', method='GET',
-                         param_count=1, status=200,
-                         response_payload='MALFORMED')        # unparseable
+    def _confirm_yes(self):
+        SAVER_LOGGER.JOptionPane.YES_OPTION = 0
+        SAVER_LOGGER.JOptionPane.showConfirmDialog = staticmethod(lambda *a: 0)
 
-        for msg in (p1, p2, r1, r2, s1, i1, x1, e1):
-            if msg is not x1:
-                msg._responded = True
-        e1._responded = True
-        x1._responded = False  # dropped connection: response event, empty body
+    def _restore_confirm(self):
+        for name in ('YES_OPTION', 'showConfirmDialog'):
+            if hasattr(SAVER_LOGGER.JOptionPane, name):
+                delattr(SAVER_LOGGER.JOptionPane, name)
 
-        # --- deliver events; response order is what assigns serial numbers ---
-        self._feed([
-            (TOOL_PROXY,    True,  p1), (TOOL_PROXY,    False, p1),
-            (TOOL_PROXY,    True,  p2), (TOOL_PROXY,    False, p2),
-            (TOOL_REPEATER, True,  r1),                        # r1, r2 in flight
-            (TOOL_REPEATER, True,  r2),
-            (TOOL_REPEATER, False, r1), (TOOL_REPEATER, False, r2),
-            (TOOL_SCANNER,  True,  s1),                        # s1, i1 in flight
-            (TOOL_INTRUDER, True,  i1),
-            (TOOL_INTRUDER, False, i1),                        # i1 responds first
-            (TOOL_SCANNER,  False, s1),                        # out of order
-            (TOOL_PROXY,    True,  x1), (TOOL_PROXY,    False, x1),
-            (TOOL_PROXY,    True,  e1), (TOOL_PROXY,    False, e1),
-        ])
+    # ---------- session construction ---------- #
 
-        self._await_rows(8)
-        # give the worker a beat to ensure nothing extra is appended
-        time.sleep(0.1)
-        self.assertEqual(len(self.ext.log_data), 8,
-                         'exactly one row per response event')
+    def _build_bulk(self, count):
+        """Generate `count` varied transactions cycling through tools,
+        methods, statuses and repeated URLs, sprinkling in dropped and
+        malformed responses."""
+        txns = []
+        for i in range(count):
+            path, params = SESSION_URLS[i % len(SESSION_URLS)]
+            method = SESSION_METHODS[i % len(SESSION_METHODS)]
+            tool_flag, tool_name = SESSION_TOOLS[i % len(SESSION_TOOLS)]
+            status = SESSION_STATUSES[i % len(SESSION_STATUSES)]
+            kind = 'normal'
+            if i % 17 == 16:
+                kind = 'dropped'
+            elif i % 19 == 18:
+                kind = 'malformed'
+            txns.append(Transaction('https://ginandjuice.shop' + path,
+                                    'ginandjuice.shop', method,
+                                    tool_flag, tool_name, params, status, kind))
+        return txns
 
-        # --- export the whole session and read it back ---
-        export_path = os.path.join(self.tmp, 'session.csv')
-        self.assertTrue(self.ext._write_full_csv(export_path))
+    def _build_specials(self):
+        """Edge-case transactions: tricky URLs, a formula-injection host, and
+        explicit dropped / malformed cases."""
+        specials = [
+            Transaction('https://ginandjuice.shop/search?q=1,2,3',
+                        'ginandjuice.shop', 'GET', 16, 'Scanner', 1, 200),
+            Transaction('https://ginandjuice.shop/list?a=1;b=2;c=3',
+                        'ginandjuice.shop', 'GET', 4, 'Proxy', 1, 200),
+            Transaction('https://ginandjuice.shop/q?name="admin"',
+                        'ginandjuice.shop', 'GET', 64, 'Repeater', 1, 200),
+            Transaction(u'https://ginandjuice.shop/café?drink=\U0001f378',
+                        'ginandjuice.shop', 'GET', 4, 'Proxy', 1, 200),
+            Transaction('https://ginandjuice.shop/api/ping',
+                        '=2+5+cmd|" /C calc"!A0', 'GET', 1024, 'Extender', 0, 200),
+            Transaction('https://ginandjuice.shop/download/report.pdf',
+                        'ginandjuice.shop', 'GET', 4, 'Proxy', 0, 200,
+                        kind='dropped'),
+            Transaction('https://ginandjuice.shop/api/broken',
+                        'ginandjuice.shop', 'POST', 32, 'Intruder', 3, 200,
+                        kind='malformed'),
+        ]
+        specials[4].formula_host = True
+        return specials
+
+    def _expected(self, master):
+        """(serial, txn, per-URL request count) for each transaction, in
+        master (response) order."""
+        counts = {}
+        out = []
+        for serial, txn in enumerate(master, start=1):
+            counts[txn.url] = counts.get(txn.url, 0) + 1
+            out.append((serial, txn, counts[txn.url]))
+        return out
+
+    # ---------- per-line verification ---------- #
+
+    def _assert_logged_row(self, row, serial, txn, count):
+        """Verify one in-memory log row, column by column. In memory the host
+        is stored verbatim - formula-injection escaping happens only at
+        export - so the raw host is expected here."""
+        where = 'serial %d (%s)' % (serial, txn.url)
+        self.assertEqual(row[C_SERIAL], serial, '%s serial' % where)
+        self.assertEqual(row[C_HOST], txn.host, '%s host' % where)
+        self.assertEqual(row[C_METHOD], txn.method, '%s method' % where)
+        self.assertEqual(row[C_URL], txn.url, '%s url' % where)
+        self.assertEqual(row[C_STATUS], txn.expected_status, '%s status' % where)
+        self.assertEqual(row[C_TOOL], txn.tool_name, '%s tool' % where)
+        self.assertEqual(row[C_COUNT], count, '%s request count' % where)
+        self.assertEqual(row[C_INSERTION], txn.params,
+                         '%s insertion points' % where)
+        self.assertTrue(TIMESTAMP_RE.match(str(row[C_START])),
+                        '%s start time %r' % (where, row[C_START]))
+        self.assertTrue(TIMESTAMP_RE.match(str(row[C_END])),
+                        '%s end time %r' % (where, row[C_END]))
+        self.assertLessEqual(row[C_START], row[C_END], '%s start after end' % where)
+
+    def _assert_log_matches(self, master):
+        """Every in-memory row, in order, one line at a time."""
+        self.assertEqual(len(self.ext.log_data), len(master),
+                         'exactly one logged row per response')
+        for i, (serial, txn, count) in enumerate(self._expected(master)):
+            self._assert_logged_row(self.ext.log_data[i], serial, txn, count)
+
+    def _assert_exported_line(self, row, serial, txn, count):
+        """Verify one parsed CSV line, column by column. At export the host
+        is formula-guarded, but every other field must round-trip exactly."""
+        where = 'line serial %d (%s)' % (serial, txn.url)
+        self.assertEqual(len(row), 10, '%s must have 10 columns' % where)
+        self.assertEqual(int(row[C_SERIAL]), serial, '%s serial' % where)
+        if txn.formula_host:
+            self.assertFalse(row[C_HOST].startswith(('=', '+', '-', '@')),
+                             '%s host must be neutralized: %r' % (where, row[C_HOST]))
+            self.assertEqual(row[C_HOST].lstrip("'"), txn.host,
+                             '%s host must round-trip after the guard' % where)
+        else:
+            self.assertEqual(row[C_HOST], txn.host, '%s host' % where)
+        self.assertEqual(row[C_METHOD], txn.method, '%s method' % where)
+        self.assertEqual(row[C_URL], txn.url,
+                         '%s url must survive export unmodified' % where)
+        self.assertEqual(row[C_STATUS], txn.expected_status, '%s status' % where)
+        self.assertEqual(row[C_TOOL], txn.tool_name, '%s tool' % where)
+        self.assertEqual(int(row[C_COUNT]), count, '%s request count' % where)
+        self.assertEqual(int(row[C_INSERTION]), txn.params,
+                         '%s insertion points' % where)
+        self.assertTrue(TIMESTAMP_RE.match(row[C_START]), '%s start time' % where)
+        self.assertTrue(TIMESTAMP_RE.match(row[C_END]), '%s end time' % where)
+        self.assertLessEqual(row[C_START], row[C_END], '%s start after end' % where)
+
+    def _assert_export_matches(self, export_path, master):
+        """Every exported CSV line, one at a time, plus file structure."""
         raw = read_raw(export_path)
-        self.assertIn('# Total Requests: 8', raw)
-        self.assertIn('# Total Requests Logged: 8', raw)
+        self.assertIn('# Total Requests: %d' % len(master), raw)
+        self.assertIn('# Total Requests Logged: %d' % len(master), raw)
 
         header, rows = read_csv_rows(export_path)
-        self.assertEqual(len(rows), 8)
+        self.assertEqual(header,
+                         ['Serial No', 'Host', 'Request Method', 'URL',
+                          'Status Code', 'Tool Name', 'Request Count',
+                          'Insertion Point Count', 'Start Time', 'End Time'])
+        # One physical data line per transaction: no row split or merged by a
+        # stray comma / newline in the data.
+        self.assertEqual(len(rows), len(master),
+                         'exported data-line count must equal transaction count')
 
-        # rows are keyed by serial number (col 0), assigned in response order
-        by_serial = dict((int(row[0]), row) for row in rows)
-        self.assertEqual(sorted(by_serial), [1, 2, 3, 4, 5, 6, 7, 8],
-                         'serials must be unique and contiguous 1..8')
+        by_serial = dict((int(row[C_SERIAL]), row) for row in rows)
+        self.assertEqual(sorted(by_serial), list(range(1, len(master) + 1)),
+                         'serials must be unique and contiguous')
+        for serial, txn, count in self._expected(master):
+            self._assert_exported_line(by_serial[serial], serial, txn, count)
 
-        # expected (Host, Method, URL, Status, Tool, ReqCount, InsertionPoints)
-        # in the exact order responses were delivered
-        expected = [
-            ('ginandjuice.shop', 'GET',  'https://ginandjuice.shop/home',        '200', 'Proxy',    '1', '0'),
-            ('ginandjuice.shop', 'GET',  'https://ginandjuice.shop/home',        '200', 'Proxy',    '2', '0'),
-            ('ginandjuice.shop', 'POST', 'https://ginandjuice.shop/login',       '302', 'Repeater', '1', '2'),
-            ('ginandjuice.shop', 'POST', 'https://ginandjuice.shop/login',       '401', 'Repeater', '2', '2'),
-            ('ginandjuice.shop', 'GET',  'https://ginandjuice.shop/item?id=1',   '500', 'Intruder', '1', '1'),
-            ('ginandjuice.shop', 'GET',  'https://ginandjuice.shop/search?q=1,2','200', 'Scanner',  '1', '1'),
-            ('ginandjuice.shop', 'GET',  'https://ginandjuice.shop/timeout',     '-',   'Proxy',    '1', '0'),
-            ('ginandjuice.shop', 'GET',  'https://ginandjuice.shop/error',       'Error','Proxy',   '1', '1'),
-        ]
-        timestamp = re.compile(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$')
-        for serial, want in enumerate(expected, start=1):
-            row = by_serial[serial]
-            host, method, url, status, tool, count, ip = want
-            self.assertEqual(row[1], host,   'row %d host' % serial)
-            self.assertEqual(row[2], method, 'row %d method' % serial)
-            self.assertEqual(row[3], url,    'row %d url (comma URL must survive)' % serial)
-            self.assertEqual(row[4], status, 'row %d status' % serial)
-            self.assertEqual(row[5], tool,   'row %d tool' % serial)
-            self.assertEqual(row[6], count,  'row %d request count' % serial)
-            self.assertEqual(row[7], ip,     'row %d insertion points' % serial)
-            self.assertTrue(timestamp.match(row[8]), 'row %d start time' % serial)
-            self.assertTrue(timestamp.match(row[9]), 'row %d end time' % serial)
-            self.assertLessEqual(row[8], row[9],
-                                 'row %d start must not be after end' % serial)
+    # ---------- the session ---------- #
+
+    def test_full_session_is_logged_and_exported_correctly(self):
+        bulk = self._build_bulk(63)
+        specials = self._build_specials()
+
+        phase_seq = bulk[0:15]       # simple back-to-back traffic
+        phase_batched = bulk[15:39]  # concurrent batches, out-of-order responses
+        phase_concurrent = bulk[39:63]  # everything in flight at once
+        # master response order == delivery order of the phases below
+        master = phase_seq + phase_batched + phase_concurrent + specials
+
+        # Phase 1 + 2
+        self._deliver(phase_seq, 'sequential')
+        self._deliver(phase_batched, 'batched')
+
+        # Mid-session checkpoint: a manual backup must capture, line for line,
+        # exactly what has been logged so far.
+        checkpoint = len(phase_seq) + len(phase_batched)
+        self._await_rows(checkpoint)
+        self._assert_log_matches(master[:checkpoint])
+        self.ext.backup_now(None)
+        backups = [n for n in os.listdir(self.tmp)
+                   if n.startswith('SAVER_LOGGER_BACKUP_')]
+        self.assertEqual(len(backups), 1, 'Backup Now must write one file')
+        self._assert_export_matches(os.path.join(self.tmp, backups[0]),
+                                    master[:checkpoint])
+
+        # Phase 3 + specials
+        self._deliver(phase_concurrent, 'concurrent')
+        self._deliver(specials, 'concurrent')
+
+        self._await_rows(len(master))
+        time.sleep(0.1)  # let the worker settle; no extra rows should appear
+
+        # Line-by-line verification of the entire in-memory log.
+        self._assert_log_matches(master)
+
+        # Every tool, method, and status family must actually be represented.
+        self.assertEqual(set(row[C_TOOL] for row in self.ext.log_data),
+                         set(name for _, name in SESSION_TOOLS),
+                         'all seven tools must appear in the log')
+        self.assertTrue(set(SESSION_METHODS).issubset(
+                            set(row[C_METHOD] for row in self.ext.log_data)),
+                        'every HTTP method must appear in the log')
+        statuses = set(row[C_STATUS] for row in self.ext.log_data)
+        self.assertIn('-', statuses, 'a dropped response must be logged')
+        self.assertIn('Error', statuses, 'an unparseable response must be logged')
+
+        # Full export round-trip, line by line.
+        export_path = os.path.join(self.tmp, 'session.csv')
+        self.assertTrue(self.ext._write_full_csv(export_path))
+        self._assert_export_matches(export_path, master)
+        exported_session = read_raw(export_path)
+
+        # --- Clear Logs, then a fresh session ---
+        self._confirm_yes()
+        try:
+            self.ext.clear_logs(None)
+        finally:
+            self._restore_confirm()
+
+        self.assertEqual(self.ext.log_data, [], 'clear must empty the log')
+        self.assertEqual(self.ext.request_counter, 0, 'clear must reset serials')
+        self.assertTrue(os.path.exists(export_path),
+                        'Clear Logs must not delete exported files')
+        self.assertEqual(read_raw(export_path), exported_session,
+                         'exported file must be unchanged by a clear')
+
+        fresh = self._build_bulk(6)
+        self._deliver(fresh, 'sequential')
+        self._await_rows(len(fresh))
+        self._assert_log_matches(fresh)  # serials restart at 1, counts fresh
+
+        fresh_path = os.path.join(self.tmp, 'fresh.csv')
+        self.assertTrue(self.ext._write_full_csv(fresh_path))
+        self._assert_export_matches(fresh_path, fresh)
 
 
 if __name__ == '__main__':
