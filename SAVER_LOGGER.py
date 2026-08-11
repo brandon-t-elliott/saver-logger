@@ -6,10 +6,10 @@ from javax.swing import (JPanel, JButton, JFileChooser, JTextPane, JScrollPane, 
 from java.awt import BorderLayout, Dimension, Font, GridBagLayout, GridBagConstraints, Insets, FlowLayout
 from java.io import FileOutputStream, OutputStreamWriter, BufferedWriter, File
 from java.nio.charset import Charset
-from java.util import Timer, TimerTask
+from java.util import Timer, TimerTask, WeakHashMap
 from java.util.concurrent import locks
 from java.lang import Thread, Runnable
-import datetime, os, time
+import datetime, os
 
 
 class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
@@ -28,8 +28,11 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
         self.runtime_id = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
         self.data_lock = locks.ReentrantLock()  # Thread safety for log_data
         
-        # Request tracking for insertion points and timing
-        self.request_tracking = {}
+        # Request tracking for insertion points and timing, keyed weakly by
+        # the message object: an entry lives exactly as long as Burp holds
+        # the message, so it cannot leak and cannot be evicted while a
+        # response is still possible.
+        self.request_tracking = WeakHashMap()
         self.tracking_lock = locks.ReentrantLock()  # Thread safety for tracking
 
         # Settings
@@ -319,28 +322,13 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
         # their own request even when multiple requests are in flight at once.
         self.tracking_lock.lock()
         try:
-            self._purge_stale_tracking()
-            self.request_tracking[messageInfo] = {
+            self.request_tracking.put(messageInfo, {
                 'start_time': start_time,
-                'created': time.time(),
                 'insertion_points': int(insertion_point_count),
                 'url': url
-            }
+            })
         finally:
             self.tracking_lock.unlock()
-
-    def _purge_stale_tracking(self):
-        """
-        Drop tracking entries whose response never arrived (dropped connections,
-        cancelled requests) so the dict cannot grow without bound.
-        Must be called with tracking_lock held.
-        """
-        if len(self.request_tracking) < 1000:
-            return
-        cutoff = time.time() - 300
-        for key in list(self.request_tracking.keys()):
-            if self.request_tracking[key]['created'] < cutoff:
-                del self.request_tracking[key]
 
     def _handle_response(self, toolFlag, messageInfo):
         """Handle response in background thread"""
@@ -375,7 +363,7 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
         # Match this response to its own request via the message object
         self.tracking_lock.lock()
         try:
-            tracking = self.request_tracking.pop(messageInfo, None)
+            tracking = self.request_tracking.remove(messageInfo)
         finally:
             self.tracking_lock.unlock()
 
@@ -591,7 +579,7 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
             
             self.tracking_lock.lock()
             try:
-                self.request_tracking = {}
+                self.request_tracking = WeakHashMap()
             finally:
                 self.tracking_lock.unlock()
             
