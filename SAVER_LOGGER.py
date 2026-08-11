@@ -6,9 +6,10 @@ from javax.swing import (JPanel, JButton, JFileChooser, JTextPane, JScrollPane, 
 from java.awt import BorderLayout, Dimension, Font, GridBagLayout, GridBagConstraints, Insets, FlowLayout
 from java.io import FileOutputStream, OutputStreamWriter, BufferedWriter, File
 from java.nio.charset import Charset
-from java.util import Timer, TimerTask, WeakHashMap
+from java.util import Timer, TimerTask
 from java.util.concurrent import locks, LinkedBlockingQueue, TimeUnit
 from java.lang import Thread, Runnable, System
+from collections import OrderedDict
 import datetime, os
 
 
@@ -33,11 +34,12 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
         self.runtime_id = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
         self.data_lock = locks.ReentrantLock()  # Thread safety for log_data
         
-        # Request tracking for insertion points and timing, keyed weakly by
-        # the message object: an entry lives exactly as long as Burp holds
-        # the message, so it cannot leak and cannot be evicted while a
-        # response is still possible.
-        self.request_tracking = WeakHashMap()
+        # Rows awaiting their response, so the response can fill in status and
+        # end time. Keyed by request content (Burp may deliver the request and
+        # response events on different IHttpRequestResponse objects, so object
+        # identity is not reliable) -> FIFO list of rows for that content.
+        # Insertion-ordered so identical requests are filled in oldest-first.
+        self.request_tracking = OrderedDict()
         self.tracking_lock = locks.ReentrantLock()  # Thread safety for tracking
 
         # Settings
@@ -334,6 +336,13 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
             self.data_lock.unlock()
         return row
 
+    def _request_key(self, messageInfo):
+        """A key identifying a request across its request and response events.
+        Derived from the request content itself (which Burp preserves on both
+        events) rather than the message object, since Burp may deliver the two
+        events on different IHttpRequestResponse instances."""
+        return self._helpers.bytesToString(messageInfo.getRequest())
+
     def _handle_request(self, toolFlag, messageInfo):
         """Log every request as its own row immediately, so a request is
         recorded even if no response ever arrives. The matching response
@@ -344,18 +353,20 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
         row = self._new_log_row(messageInfo, req, toolFlag,
                                 self.PENDING, start_time, self.PENDING)
 
-        # Remember the row (keyed weakly by the message) so this request's
-        # response can fill it in when it arrives.
+        # Remember the row under its request content so the response can fill
+        # it in when it arrives.
+        key = self._request_key(messageInfo)
         self.tracking_lock.lock()
         try:
-            self.request_tracking.put(messageInfo, row)
+            self.request_tracking.setdefault(key, []).append(row)
         finally:
             self.tracking_lock.unlock()
 
     def _handle_response(self, toolFlag, messageInfo):
         """Fill in the status and end time on the row created for this
-        message's request. If there is no such row (a response with no request
-        event), log the response as its own row so it is not lost."""
+        request. If no pending row matches (a response with no request event
+        at all), log the response as its own row - but a response never
+        duplicates a request that was already logged."""
         res_bytes = messageInfo.getResponse()
         status = self.PENDING
         if res_bytes:
@@ -367,10 +378,17 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
 
         end_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-        # Match this response to its own request via the message object
+        # Match this response to its request's row by request content.
+        key = self._request_key(messageInfo)
         self.tracking_lock.lock()
         try:
-            row = self.request_tracking.remove(messageInfo)
+            rows = self.request_tracking.get(key)
+            if rows:
+                row = rows.pop(0)
+                if not rows:
+                    del self.request_tracking[key]
+            else:
+                row = None
         finally:
             self.tracking_lock.unlock()
 
@@ -383,7 +401,7 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
             finally:
                 self.data_lock.unlock()
         else:
-            # No request row for this message: log the response on its own.
+            # No pending request row: log the response on its own.
             req = self._helpers.analyzeRequest(messageInfo)
             self._new_log_row(messageInfo, req, toolFlag, status, end_time, end_time)
 
@@ -636,7 +654,7 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
             
             self.tracking_lock.lock()
             try:
-                self.request_tracking = WeakHashMap()
+                self.request_tracking = OrderedDict()
             finally:
                 self.tracking_lock.unlock()
             

@@ -12,7 +12,6 @@ corresponding fix PRs; on the fix branches they pass. See tests/README.md for
 the branch-by-branch expectations and how to run the suite against a branch.
 """
 import csv
-import gc
 import io
 import os
 import re
@@ -68,19 +67,29 @@ class MockHttpService(object):
 
 
 class MockMessage(object):
-    """One HTTP message. The same object is passed for the request and the
-    response event, mirroring Burp's legacy IHttpListener behavior."""
+    """One HTTP message event. Burp does NOT guarantee the same
+    IHttpRequestResponse instance for a message's request and response events,
+    so tests can build two MockMessage objects that share a request payload to
+    model that. `getRequest()` returns that payload (unique per request unless
+    shared), which is how the extension correlates the two events."""
+
+    _seq = 0
 
     def __init__(self, url, host='ginandjuice.shop', method='GET',
-                 param_count=0, status=200, response_payload='RESPONSE-BYTES'):
+                 param_count=0, status=200, response_payload='RESPONSE-BYTES',
+                 request_payload=None):
+        if request_payload is None:
+            MockMessage._seq += 1
+            request_payload = 'REQ-%d %s' % (MockMessage._seq, url)
         self.request_info = MockRequestInfo(url, method, param_count)
         self._status = status
         self._service = MockHttpService(host)
         self._responded = False
         self._response_payload = response_payload
+        self._request_payload = request_payload
 
     def getRequest(self):
-        return b'REQUEST-BYTES'
+        return self._request_payload
 
     def getResponse(self):
         if self._responded:
@@ -101,6 +110,11 @@ class MockHelpers(object):
         if response_bytes[0] == 'MALFORMED':
             raise ValueError('malformed response')
         return MockResponseInfo(response_bytes[1])
+
+    def bytesToString(self, data):
+        # Burp's helper turns request/response byte[] into a String; the mock's
+        # payloads are already strings.
+        return data if isinstance(data, str) else str(data)
 
 
 class MockCallbacks(object):
@@ -301,46 +315,84 @@ class SaverLoggerTest(unittest.TestCase):
         self.assertEqual(rows['https://ginandjuice.shop/slow'][COL_INSERTION_POINTS], 3)
         self.assertEqual(rows['https://ginandjuice.shop/fast'][COL_INSERTION_POINTS], 1)
 
-    def test_in_flight_requests_keep_tracking_entries(self):
-        """Demonstrates: every in-flight request must keep its own tracking
-        entry until its response arrives - entries may be evicted only when
-        the message itself is gone, never while a response is still possible.
-
-        On main, all in-flight requests share one guessed key, so 1500
-        in-flight requests leave a single tracking entry.
-        """
+    def test_in_flight_requests_are_logged_and_tracked(self):
+        """Every in-flight request is logged immediately and keeps a pending
+        tracking entry until its response fills the row in."""
         messages = [MockMessage('https://ginandjuice.shop/inflight/%d' % i,
                                 param_count=1)
                     for i in range(1500)]
         for msg in messages:
             self.ext._handle_request(4, msg)
 
+        self.assertEqual(len(self.ext.log_data), 1500,
+                         'every request is logged immediately')
         self.assertEqual(len(self.ext.request_tracking), 1500,
-                         'every in-flight request must keep its own entry')
+                         'every in-flight request keeps a pending entry')
 
         for msg in messages:
             self._respond(msg)
         self.assertEqual(len(self.ext.request_tracking), 0,
-                         'entries must be removed once the response is logged')
-        self.assertEqual(len(self.ext.log_data), 1500)
+                         'entries are removed once the response fills the row')
+        self.assertEqual(len(self.ext.log_data), 1500,
+                         'responses update rows, they do not add new ones')
 
-    def test_tracking_entries_die_with_their_messages(self):
-        """Demonstrates (against fix-request-correlation as first pushed):
-        tracking entries for messages the tool has abandoned - no response
-        will ever arrive - must be released with the message, not held
-        strongly until a timed purge.
+    def test_identical_concurrent_requests_correlate_fifo(self):
+        """Two identical in-flight requests (same request content) are each
+        logged, and their responses fill in the two rows oldest-first - no
+        duplicate row, and no request left without its response."""
+        content = 'GET /dup HTTP/1.1\r\nHost: ginandjuice.shop\r\n\r\n'
+        r1 = MockMessage('https://ginandjuice.shop/dup', param_count=1,
+                         request_payload=content)
+        r2 = MockMessage('https://ginandjuice.shop/dup', param_count=1,
+                         request_payload=content)
+        self.ext._handle_request(4, r1)
+        self.ext._handle_request(4, r2)
+        self.assertEqual(len(self.ext.log_data), 2, 'both requests logged')
 
-        Passes on main only via the overwrite bug (single shared key).
+        resp1 = MockMessage('https://ginandjuice.shop/dup', param_count=1,
+                            status=200, request_payload=content)
+        resp2 = MockMessage('https://ginandjuice.shop/dup', param_count=1,
+                            status=500, request_payload=content)
+        resp1._responded = True
+        resp2._responded = True
+        self.ext._handle_response(4, resp1)
+        self.ext._handle_response(4, resp2)
+
+        self.assertEqual(len(self.ext.log_data), 2,
+                         'responses update the two rows, no duplicates')
+        self.assertEqual(sorted(row[4] for row in self.ext.log_data),
+                         ['200', '500'], 'both responses were applied')
+        self.assertEqual(len(self.ext.request_tracking), 0,
+                         'no pending entries remain')
+
+    def test_response_on_different_message_object_updates_row(self):
+        """Burp does not guarantee the same IHttpRequestResponse instance for
+        a message's request and response events. When the response arrives on
+        a different object, it must still fill in the request's row (matched by
+        host/method/URL) rather than append a duplicate.
+
+        Reproduces the reported bug: the request is logged once (pending) and
+        again with the response, giving two rows for one request.
         """
-        for i in range(1500):
-            msg = MockMessage('https://ginandjuice.shop/abandoned/%d' % i)
-            self.ext._handle_request(4, msg)
-            # msg goes out of scope here: no response will ever arrive
-        gc.collect()
+        req_msg = MockMessage('https://ginandjuice.shop/reused', method='GET',
+                              param_count=2, status=200)
+        self.ext._handle_request(4, req_msg)
+        self.assertEqual(len(self.ext.log_data), 1, 'request logged once')
 
-        self.assertLessEqual(len(self.ext.request_tracking), 10,
-                             'abandoned messages must not leave tracking '
-                             'entries behind')
+        # A DISTINCT object for the response event that carries the same
+        # request content (as Burp's response messageInfo does).
+        resp_msg = MockMessage('https://ginandjuice.shop/reused', method='GET',
+                               param_count=2, status=200,
+                               request_payload=req_msg.getRequest())
+        resp_msg._responded = True
+        self.ext._handle_response(4, resp_msg)
+
+        self.assertEqual(len(self.ext.log_data), 1,
+                         'the response must update the request row, not add a '
+                         'duplicate')
+        row = self.ext.log_data[0]
+        self.assertEqual(row[4], '200', 'status filled in on the request row')
+        self.assertNotEqual(row[9], '-', 'end time filled in on the request row')
 
     # ---------- queue / worker path ---------- #
 
@@ -756,10 +808,16 @@ class Transaction(object):
 
     def __init__(self, url, host, method, tool_flag, tool_name,
                  params, status, kind='normal'):
-        payload = 'MALFORMED' if kind == 'malformed' else 'RESPONSE-BYTES'
-        self.msg = MockMessage(url, host=host, method=method,
-                               param_count=params, status=status,
-                               response_payload=payload)
+        # Distinct message objects for the request and response events, sharing
+        # the same request content - mirroring that Burp may hand the two
+        # events different IHttpRequestResponse instances.
+        self.request_msg = MockMessage(url, host=host, method=method,
+                                       param_count=params, status=status)
+        response_payload = 'MALFORMED' if kind == 'malformed' else 'RESPONSE-BYTES'
+        self.response_msg = MockMessage(url, host=host, method=method,
+                                        param_count=params, status=status,
+                                        response_payload=response_payload,
+                                        request_payload=self.request_msg.getRequest())
         self.url = url
         self.host = host
         self.method = method
@@ -818,12 +876,12 @@ class EndToEndSessionTest(unittest.TestCase):
 
     def _send_request(self, txn):
         self._request_order.append(txn)
-        self.ext.processHttpMessage(txn.tool_flag, True, txn.msg)
+        self.ext.processHttpMessage(txn.tool_flag, True, txn.request_msg)
 
     def _send_response(self, txn):
         # A dropped connection fires a response event with no body.
-        txn.msg._responded = (txn.kind != 'dropped')
-        self.ext.processHttpMessage(txn.tool_flag, False, txn.msg)
+        txn.response_msg._responded = (txn.kind != 'dropped')
+        self.ext.processHttpMessage(txn.tool_flag, False, txn.response_msg)
 
     def _deliver(self, txns, mode):
         """Deliver a phase of transactions. Rows are logged at request time,
