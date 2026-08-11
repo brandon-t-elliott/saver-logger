@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import types
+import weakref
 
 try:
     import queue as _queue
@@ -118,6 +119,36 @@ class Timer(object):
 
     def cancel(self):
         self.cancelled = True
+
+
+class WeakHashMap(object):
+    """Weak-keyed map like java.util.WeakHashMap: an entry lives only as
+    long as its key object is referenced elsewhere. CPython's reference
+    counting makes eviction deterministic here; the JVM's GC is lazier but
+    gives the same reachability guarantee."""
+
+    def __init__(self):
+        self._map = weakref.WeakKeyDictionary()
+
+    def put(self, key, value):
+        previous = self._map.get(key)
+        self._map[key] = value
+        return previous
+
+    def get(self, key):
+        return self._map.get(key)
+
+    def remove(self, key):
+        return self._map.pop(key, None)
+
+    def containsKey(self, key):
+        return key in self._map
+
+    def size(self):
+        return len(self._map)
+
+    def __len__(self):
+        return len(self._map)
 
 
 # --------------- java.util.concurrent --------------- #
@@ -273,7 +304,8 @@ def install():
     java.nio = _module('java.nio')
     java.nio.charset = _module('java.nio.charset', Charset=Charset)
     java.lang = _module('java.lang', Thread=Thread, Runnable=Runnable, System=System)
-    java.util = _module('java.util', Timer=Timer, TimerTask=TimerTask)
+    java.util = _module('java.util', Timer=Timer, TimerTask=TimerTask,
+                        WeakHashMap=WeakHashMap)
     locks = _module('java.util.concurrent.locks', ReentrantLock=ReentrantLock)
     java.util.concurrent = _module('java.util.concurrent',
                                    locks=locks,

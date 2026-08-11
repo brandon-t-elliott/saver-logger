@@ -28,8 +28,8 @@ suite fails in exactly the places the fix branches address:
 | `test_worker_processes_queued_messages_end_to_end` | pass | — (characterization for `performance`) |
 | `test_concurrent_requests_keep_their_own_data` | **FAIL** | `fix-request-correlation` |
 | `test_out_of_order_responses_keep_their_own_data` | **FAIL** | `fix-request-correlation` |
-| `test_tracking_dict_stays_bounded` | pass¹ | `fix-request-correlation` |
-| `test_tracking_dict_capped_under_burst` | pass¹ | `fix-request-correlation` (size-cap hardening; **red on that branch** until it lands) |
+| `test_in_flight_requests_keep_tracking_entries` | **FAIL** | `fix-request-correlation` |
+| `test_tracking_entries_die_with_their_messages` | pass¹ | `fix-request-correlation` (WeakHashMap redesign; **red on that branch** until it lands) |
 | `test_csv_preserves_commas_in_fields` | **FAIL** | `csv-integrity` |
 | `test_csv_formula_injection_neutralized` | **FAIL** | `csv-integrity` |
 | `test_csv_footer_records_burp_version` | **FAIL** | `csv-integrity` |
@@ -37,12 +37,14 @@ suite fails in exactly the places the fix branches address:
 | `test_unload_saves_queued_messages` | **FAIL** | `reliability-fixes` |
 | `test_auto_backup_survives_missing_folder` | **FAIL** | `reliability-fixes` |
 
-¹ These pass on `main` only as a side effect of the overwrite bug (the
-tracking dict never grows past ~1 entry because concurrent requests clobber
-the same key — the very defect the two correlation tests fail on). They pin
-the bounded-memory properties that the keyed design must maintain: stale
-entries get purged, and a burst arriving faster than the stale cutoff is
-still size-capped.
+¹ Passes on `main` only as a side effect of the overwrite bug (the tracking
+dict never grows past ~1 entry because concurrent requests clobber the same
+key — the very defect the correlation tests fail on). Together with the
+in-flight test it pins the lifetime contract of the keyed design: an entry
+lives exactly as long as its message (in-flight requests always keep their
+data; abandoned messages are reclaimed with the object). CPython's reference
+counting makes the eviction deterministic in tests; the JVM's GC is lazier
+but provides the same reachability guarantee.
 
 ## Testing a fix branch
 

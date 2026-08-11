@@ -12,6 +12,7 @@ corresponding fix PRs; on the fix branches they pass. See tests/README.md for
 the branch-by-branch expectations and how to run the suite against a branch.
 """
 import csv
+import gc
 import io
 import os
 import shutil
@@ -120,18 +121,6 @@ class MockCallbacks(object):
 
     def getBurpVersion(self):
         return ['Burp Suite Professional', '2025', '.8.1']
-
-
-class FakeClock(object):
-    """Deterministic replacement for the time module."""
-
-    def __init__(self, start=1000000.0, step=1.0):
-        self.now = start
-        self.step = step
-
-    def time(self):
-        self.now += self.step
-        return self.now
 
 
 class UnserializableField(object):
@@ -245,47 +234,46 @@ class SaverLoggerTest(unittest.TestCase):
         self.assertEqual(rows['https://ginandjuice.shop/slow'][COL_INSERTION_POINTS], 3)
         self.assertEqual(rows['https://ginandjuice.shop/fast'][COL_INSERTION_POINTS], 1)
 
-    def test_tracking_dict_stays_bounded(self):
-        """Property of the fix: unanswered requests must not accumulate
-        forever in the tracking dict.
+    def test_in_flight_requests_keep_tracking_entries(self):
+        """Demonstrates: every in-flight request must keep its own tracking
+        entry until its response arrives - entries may be evicted only when
+        the message itself is gone, never while a response is still possible.
 
-        Note: this passes on main too, but only because main's overwrite bug
-        keeps the dict at size ~1 - the same defect the two tests above fail
-        on. It exists to pin the bounded-memory property of the keyed design.
+        On main, all in-flight requests share one guessed key, so 1500
+        in-flight requests leave a single tracking entry.
         """
-        original = getattr(SAVER_LOGGER, 'time', None)
-        SAVER_LOGGER.time = FakeClock()
-        try:
-            for i in range(1500):
-                msg = MockMessage('https://ginandjuice.shop/unanswered/%d' % i)
-                self.ext._handle_request(4, msg)
-            self.assertLess(len(self.ext.request_tracking), 1500,
-                            'unanswered requests must not accumulate forever')
-        finally:
-            if original is not None:
-                SAVER_LOGGER.time = original
+        messages = [MockMessage('https://ginandjuice.shop/inflight/%d' % i,
+                                param_count=1)
+                    for i in range(1500)]
+        for msg in messages:
+            self.ext._handle_request(4, msg)
 
-    def test_tracking_dict_capped_under_burst(self):
-        """Demonstrates (against fix-request-correlation): a request burst
-        arriving faster than the stale-entry cutoff must still be bounded by
-        a hard size cap, since the tracking entries hold references to full
-        message objects.
+        self.assertEqual(len(self.ext.request_tracking), 1500,
+                         'every in-flight request must keep its own entry')
 
-        Passes on main only via the overwrite bug (dict stays at ~1 entry);
-        red on the fix branch until its purge gains a size cap.
+        for msg in messages:
+            self._respond(msg)
+        self.assertEqual(len(self.ext.request_tracking), 0,
+                         'entries must be removed once the response is logged')
+        self.assertEqual(len(self.ext.log_data), 1500)
+
+    def test_tracking_entries_die_with_their_messages(self):
+        """Demonstrates (against fix-request-correlation as first pushed):
+        tracking entries for messages the tool has abandoned - no response
+        will ever arrive - must be released with the message, not held
+        strongly until a timed purge.
+
+        Passes on main only via the overwrite bug (single shared key).
         """
-        original = getattr(SAVER_LOGGER, 'time', None)
-        SAVER_LOGGER.time = FakeClock(step=0.01)  # 3000 requests in ~1 minute
-        try:
-            for i in range(3000):
-                msg = MockMessage('https://ginandjuice.shop/burst/%d' % i)
-                self.ext._handle_request(4, msg)
-            self.assertLessEqual(len(self.ext.request_tracking), 2000,
-                                 'tracking dict must be hard-capped even '
-                                 'when no entry is stale yet')
-        finally:
-            if original is not None:
-                SAVER_LOGGER.time = original
+        for i in range(1500):
+            msg = MockMessage('https://ginandjuice.shop/abandoned/%d' % i)
+            self.ext._handle_request(4, msg)
+            # msg goes out of scope here: no response will ever arrive
+        gc.collect()
+
+        self.assertLessEqual(len(self.ext.request_tracking), 10,
+                             'abandoned messages must not leave tracking '
+                             'entries behind')
 
     # ---------- queue / worker path ---------- #
 
