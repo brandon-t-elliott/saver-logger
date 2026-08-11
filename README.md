@@ -17,10 +17,7 @@ SAVER_LOGGER is a professionally engineered extension for Burp Suite that automa
 ### Core Functionality
 - ✅ **Comprehensive Logging**: Captures every HTTP request from all Burp tools
 - ✅ **Complete Metadata**: Host, method, URL, status code, tool source, insertion points, and timing
-- ✅ **Insertion Point Detection**: 
-  - Intruder: Counts `§` payload markers
-  - Scanner: Counts tested parameters
-  - Other tools: Identifies available parameters
+- ✅ **Insertion Point Detection**: Counts the HTTP parameters in each request (URL, body, and cookie parameters) as potential insertion points, uniformly for all tools
 - ✅ **Request Counting**: Tracks how many times each URL has been accessed
 - ✅ **Timing Analysis**: Records start and end timestamps for each request
 
@@ -61,7 +58,7 @@ SAVER_LOGGER is a professionally engineered extension for Burp Suite that automa
 ### Step 3: Load Extension
 1. Go to: **Extensions > Installed > Add**
 2. **Extension type**: Python
-3. **Extension file**: Select `saver_logger.py`
+3. **Extension file**: Select `SAVER_LOGGER.py`
 4. Click **Next**
 5. Verify "SAVER_LOGGER" appears in the Extensions list
 
@@ -143,11 +140,8 @@ All exported CSV files contain the following 10 columns:
 
 ### Insertion Point Detection Logic
 
-| Tool | Detection Method |
-|------|------------------|
-| **Intruder** | Counts `§` payload markers (divided by 2) |
-| **Scanner** | Counts all HTTP parameters being tested |
-| **Other Tools** | Counts available parameters in request |
+For every tool, the extension counts the HTTP parameters present in the
+request (URL, body, and cookie parameters) as potential insertion points.
 
 ### Header Metadata
 
@@ -181,7 +175,7 @@ Every CSV file concludes with:
 Serial No,Host,Request Method,URL,Status Code,Tool Name,Request Count,Insertion Point Count,Start Time,End Time
 1,example.com,GET,https://example.com/api/users,200,Proxy,1,0,2025-12-24 14:25:10,2025-12-24 14:25:11
 2,example.com,POST,https://example.com/api/login,200,Repeater,1,2,2025-12-24 14:26:15,2025-12-24 14:26:16
-3,example.com,GET,https://example.com/api/data?id=§1§&type=§test§,200,Intruder,1,2,2025-12-24 14:28:20,2025-12-24 14:28:21
+3,example.com,GET,https://example.com/api/data?id=1&type=test,200,Intruder,1,2,2025-12-24 14:28:20,2025-12-24 14:28:21
 
 # --- FOOTER METADATA ---
 # Burp Suite Version: Burp Suite Professional 2024.9.2
@@ -196,7 +190,7 @@ Serial No,Host,Request Method,URL,Status Code,Tool Name,Request Count,Insertion 
 
 ### Architecture
 - **Language**: Jython (Python for Java)
-- **Burp API**: IBurpExtender, IHttpListener, IScannerListener, IExtensionStateListener, ITab
+- **Burp API**: IBurpExtender, IHttpListener, IExtensionStateListener, ITab
 - **Encoding**: UTF-8 for international character support
 - **Threading**: Timer-based background scheduler for auto-backups
 
