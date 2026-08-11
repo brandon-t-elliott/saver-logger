@@ -8,7 +8,7 @@ from java.io import FileOutputStream, OutputStreamWriter, BufferedWriter, File
 from java.nio.charset import Charset
 from java.util import Timer, TimerTask, WeakHashMap
 from java.util.concurrent import locks
-from java.lang import Thread, Runnable
+from java.lang import Thread, Runnable, System
 import datetime, os
 
 
@@ -278,7 +278,6 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
                         self.extender._auto_backup()
                         self.extender.last_backup_time = current_time
 
-        from java.lang import System
         delay = 10000  # 10 seconds initial delay
         period = self.backup_interval_seconds * 1000
         self.backup_timer.schedule(Task(self), delay, period)
@@ -415,12 +414,36 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
 
     # ------------- EXPORT + BACKUP ------------- #
 
+    def _ensure_backup_folder(self, folder):
+        """
+        Create the backup folder if it does not exist (the default, Desktop,
+        is absent on many Linux/headless systems). Returns True when the
+        folder is usable; failures are reported instead of being silent.
+        """
+        if os.path.isdir(folder):
+            return True
+        try:
+            os.makedirs(folder)
+            self._append_status("\n[%s] Created backup folder: %s" %
+                                (datetime.datetime.now().strftime('%H:%M:%S'), folder))
+            return True
+        except OSError as e:
+            print("[SAVER_LOGGER] Backup folder unavailable: %s (%s)" % (folder, str(e)))
+            self._append_status("\n[%s] Backup folder unavailable: %s" %
+                                (datetime.datetime.now().strftime('%H:%M:%S'), folder))
+            return False
+
     def backup_now(self, event):
         """Manual backup button - saves to configured backup folder with timestamp"""
+        if not self._ensure_backup_folder(self.backup_folder):
+            JOptionPane.showMessageDialog(self.panel,
+                                          "Backup failed! Folder unavailable:\n%s" % self.backup_folder)
+            return
+
         timestamp = datetime.datetime.now().strftime('%d%m%Y_%H%M%S')
         filename = "SAVER_LOGGER_BACKUP_%s.csv" % timestamp
         filepath = os.path.join(self.backup_folder, filename)
-        
+
         result = self._write_full_csv(filepath)
         if result:
             count = 0
@@ -448,11 +471,14 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
         
         if not has_data:
             return
-        
+
+        if not self._ensure_backup_folder(self.backup_folder):
+            return
+
         # Auto-backup uses a consistent filename (overwrites each time)
         filename = "SAVER_LOGGER_AUTOSAVE.csv"
         filepath = os.path.join(self.backup_folder, filename)
-        
+
         result = self._write_full_csv(filepath)
         if result:
             count = 0
@@ -461,9 +487,12 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
                 count = len(self.log_data)
             finally:
                 self.data_lock.unlock()
-            
-            self._append_status("\n[%s] Auto-backup: %d requests saved" % 
+
+            self._append_status("\n[%s] Auto-backup: %d requests saved" %
                                     (datetime.datetime.now().strftime('%H:%M:%S'), count))
+        else:
+            self._append_status("\n[%s] Auto-backup FAILED - check extension console" %
+                                    datetime.datetime.now().strftime('%H:%M:%S'))
 
     def export_csv_manual(self, event):
         """Manual CSV export with file chooser"""
@@ -636,7 +665,18 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
         # Cancel backup timer
         if self.backup_timer:
             self.backup_timer.cancel()
-        
+
+        # Process anything the worker had not gotten to, so the exit backup
+        # includes messages queued right up to shutdown
+        self.queue_lock.lock()
+        try:
+            remaining = self.processing_queue
+            self.processing_queue = []
+        finally:
+            self.queue_lock.unlock()
+        for work_item in remaining:
+            self._process_request_data(work_item)
+
         # Final backup on exit with timestamp
         self.data_lock.lock()
         try:
@@ -644,11 +684,11 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
         finally:
             self.data_lock.unlock()
         
-        if has_data:
+        if has_data and self._ensure_backup_folder(self.backup_folder):
             timestamp = datetime.datetime.now().strftime('%d%m%Y_%H%M%S')
             filename = "SAVER_LOGGER_AUTOSAVE_%s.csv" % timestamp
             filepath = os.path.join(self.backup_folder, filename)
-            
+
             self._write_full_csv(filepath)
             
             self.data_lock.lock()
