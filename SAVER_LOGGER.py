@@ -14,6 +14,10 @@ import datetime, os
 
 class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
 
+    # Placeholder for the Status Code / End Time columns of a request that has
+    # been logged but whose response has not arrived (or never will).
+    PENDING = "-"
+
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
@@ -293,37 +297,67 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
 
         self.processing_queue.put(work_item)
 
-    def _handle_request(self, toolFlag, messageInfo):
-        """Handle request in background thread"""
-        req = self._helpers.analyzeRequest(messageInfo)
+    def _new_log_row(self, messageInfo, req, toolFlag, status, start_time, end_time):
+        """Build and append a log row, assigning the serial and per-URL count
+        under a single data_lock hold (so a concurrent clear_logs cannot
+        interleave), and return the row for later in-place updates."""
         url = str(req.getUrl())
-        request_bytes = messageInfo.getRequest()
+        host = messageInfo.getHttpService().getHost()
+        method = req.getMethod()
         tool = self._callbacks.getToolName(toolFlag)
-        
-        # Count insertion points
-        insertion_point_count = self._count_insertion_points(req, request_bytes, tool)
-        
-        # Track request start time
+        insertion_points = self._count_insertion_points(req, messageInfo.getRequest(), tool)
+
+        self.data_lock.lock()
+        try:
+            self.request_counter += 1
+            serial = self.request_counter
+
+            # Count how many times this URL has been requested (O(1) instead
+            # of scanning the whole log on every message)
+            request_count = self.url_request_counts.get(url, 0) + 1
+            self.url_request_counts[url] = request_count
+
+            row = [
+                serial,             # Serial No
+                host,               # Host
+                method,             # Request Method
+                url,                # URL
+                status,             # Status Code
+                tool,               # Tool Name
+                request_count,      # Request Count
+                insertion_points,   # Insertion Point Count
+                start_time,         # Start Time
+                end_time            # End Time
+            ]
+            self.log_data.append(row)
+        finally:
+            self.data_lock.unlock()
+        return row
+
+    def _handle_request(self, toolFlag, messageInfo):
+        """Log every request as its own row immediately, so a request is
+        recorded even if no response ever arrives. The matching response
+        fills in the status and end time later."""
+        req = self._helpers.analyzeRequest(messageInfo)
         start_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-        # Key tracking by the message object itself so responses are matched to
-        # their own request even when multiple requests are in flight at once.
+        row = self._new_log_row(messageInfo, req, toolFlag,
+                                self.PENDING, start_time, self.PENDING)
+
+        # Remember the row (keyed weakly by the message) so this request's
+        # response can fill it in when it arrives.
         self.tracking_lock.lock()
         try:
-            self.request_tracking.put(messageInfo, {
-                'start_time': start_time,
-                'insertion_points': int(insertion_point_count),
-                'url': url
-            })
+            self.request_tracking.put(messageInfo, row)
         finally:
             self.tracking_lock.unlock()
 
     def _handle_response(self, toolFlag, messageInfo):
-        """Handle response in background thread"""
-        req = self._helpers.analyzeRequest(messageInfo)
+        """Fill in the status and end time on the row created for this
+        message's request. If there is no such row (a response with no request
+        event), log the response as its own row so it is not lost."""
         res_bytes = messageInfo.getResponse()
-
-        status = "-"
+        status = self.PENDING
         if res_bytes:
             try:
                 res = self._helpers.analyzeResponse(res_bytes)
@@ -331,57 +365,27 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
             except:
                 status = "Error"
 
-        url = str(req.getUrl())
-        host = messageInfo.getHttpService().getHost()
-        method = req.getMethod()
-        tool = self._callbacks.getToolName(toolFlag)
         end_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
         # Match this response to its own request via the message object
         self.tracking_lock.lock()
         try:
-            tracking = self.request_tracking.remove(messageInfo)
+            row = self.request_tracking.remove(messageInfo)
         finally:
             self.tracking_lock.unlock()
 
-        if tracking is not None:
-            start_time = tracking['start_time']
-            insertion_points = tracking['insertion_points']
+        if row is not None:
+            # Update the existing request row in place.
+            self.data_lock.lock()
+            try:
+                row[4] = status      # Status Code
+                row[9] = end_time    # End Time
+            finally:
+                self.data_lock.unlock()
         else:
-            # Request event was missed (or Burp delivered the response on a
-            # different message object): analyze the request now instead of
-            # attaching another request's data to this row.
-            start_time = end_time
-            insertion_points = self._count_insertion_points(req, messageInfo.getRequest(), tool)
-
-        # Assign the serial, bump the per-URL count, and append the row under
-        # a SINGLE data_lock hold. Splitting these across separate locks would
-        # let a concurrent clear_logs run in the gap and orphan a row with a
-        # stale serial number in a just-cleared log.
-        self.data_lock.lock()
-        try:
-            self.request_counter += 1
-            current_id = self.request_counter
-
-            # Count how many times this URL has been requested (O(1) instead
-            # of scanning the whole log on every response)
-            request_count = self.url_request_counts.get(url, 0) + 1
-            self.url_request_counts[url] = request_count
-
-            self.log_data.append([
-                current_id,                 # Serial No
-                host,                       # Host
-                method,                     # Request Method
-                url,                        # URL
-                status,                     # Status Code
-                tool,                       # Tool Name
-                request_count,              # Request Count
-                insertion_points,           # Insertion Point Count
-                start_time,                 # Start Time
-                end_time                    # End Time
-            ])
-        finally:
-            self.data_lock.unlock()
+            # No request row for this message: log the response on its own.
+            req = self._helpers.analyzeRequest(messageInfo)
+            self._new_log_row(messageInfo, req, toolFlag, status, end_time, end_time)
 
     def _count_insertion_points(self, req, request_bytes, tool):
         """
@@ -554,8 +558,9 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
             if not self.log_data:
                 return False
 
-            # Create a snapshot of the data
-            data_snapshot = list(self.log_data)
+            # Snapshot copies of each row, so a response updating a row's
+            # status/end time in place cannot change the export mid-write.
+            data_snapshot = [list(row) for row in self.log_data]
         finally:
             self.data_lock.unlock()
 

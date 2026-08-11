@@ -452,19 +452,44 @@ class SaverLoggerTest(unittest.TestCase):
 
     # ---------- concurrency / robustness fixes ---------- #
 
-    def test_handle_response_appends_row_under_single_lock(self):
-        """Demonstrates: the serial increment and the row append must happen
-        under one data_lock hold, so a concurrent Clear Logs cannot run
-        between them and orphan a row with a stale serial number.
-        """
+    def test_request_is_logged_immediately_with_pending_response(self):
+        """Every request is logged as its own row as soon as it is seen, with
+        placeholder status/end time, so a request whose response never arrives
+        is still recorded. The response then fills in that same row."""
+        timestamp = re.compile(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$')
+        msg = MockMessage('https://ginandjuice.shop/pending', method='POST',
+                          param_count=2, status=200)
+        self.ext._handle_request(4, msg)
+
+        self.assertEqual(len(self.ext.log_data), 1,
+                         'the request must be logged before any response')
+        row = self.ext.log_data[0]
+        self.assertEqual(row[0], 1)                              # Serial No
+        self.assertEqual(row[2], 'POST')                        # Method
+        self.assertEqual(row[3], 'https://ginandjuice.shop/pending')
+        self.assertEqual(row[4], '-')                           # Status pending
+        self.assertEqual(row[COL_INSERTION_POINTS], 2)          # from the request
+        self.assertTrue(timestamp.match(row[8]))               # Start Time set
+        self.assertEqual(row[9], '-')                           # End Time pending
+
+        # The response fills in status and end time on the SAME row.
+        msg._responded = True
+        self.ext._handle_response(4, msg)
+
+        self.assertEqual(len(self.ext.log_data), 1,
+                         'the response must update the row, not append a new one')
+        row = self.ext.log_data[0]
+        self.assertEqual(row[4], '200')
+        self.assertTrue(timestamp.match(row[9]))
+
+    def test_request_appends_row_under_single_lock(self):
+        """The serial increment and row append happen under one data_lock
+        hold, so a concurrent Clear Logs cannot orphan a stale-serial row."""
         spy = CountingLock(self.ext.data_lock)
         self.ext.data_lock = spy
 
         msg = MockMessage('https://ginandjuice.shop/atomic', param_count=1)
         self.ext._handle_request(4, msg)
-        spy.acquires = 0  # count only the response handling
-        msg._responded = True
-        self.ext._handle_response(4, msg)
 
         self.assertEqual(spy.acquires, 1,
                          'serial assignment and row append must be a single '
@@ -779,6 +804,9 @@ class EndToEndSessionTest(unittest.TestCase):
         self.ext = SAVER_LOGGER.BurpExtender()
         self.ext.registerExtenderCallbacks(MockCallbacks())
         self.ext.backup_folder = self.tmp
+        # Transactions in the order their requests are delivered. Rows are
+        # logged at request time, so this is also the serial-number order.
+        self._request_order = []
 
     def tearDown(self):
         self.ext.shutdown_flag = True
@@ -789,6 +817,7 @@ class EndToEndSessionTest(unittest.TestCase):
     # ---------- delivery helpers ---------- #
 
     def _send_request(self, txn):
+        self._request_order.append(txn)
         self.ext.processHttpMessage(txn.tool_flag, True, txn.msg)
 
     def _send_response(self, txn):
@@ -797,9 +826,9 @@ class EndToEndSessionTest(unittest.TestCase):
         self.ext.processHttpMessage(txn.tool_flag, False, txn.msg)
 
     def _deliver(self, txns, mode):
-        """Deliver a phase of transactions. Responses are always enqueued in
-        list order, so serial numbers follow the master transaction order
-        regardless of how requests are interleaved.
+        """Deliver a phase of transactions. Rows are logged at request time,
+        so serial numbers follow the order requests are delivered (recorded in
+        self._request_order); responses fill in status/end time afterwards.
 
         mode 'sequential'  - request then response, one at a time
              'batched'     - batches of 5: all requests (scrambled), then
@@ -826,18 +855,22 @@ class EndToEndSessionTest(unittest.TestCase):
         else:
             raise ValueError('unknown delivery mode: %s' % mode)
 
-    def _await_rows(self, expected, timeout=15):
+    def _await_settled(self, expected, timeout=15):
+        """Wait until at least `expected` rows exist and every row has had its
+        response applied (End Time no longer the pending placeholder)."""
+        pending = SAVER_LOGGER.BurpExtender.PENDING
         deadline = time.time() + timeout
         while time.time() < deadline:
             self.ext.data_lock.lock()
             try:
-                if len(self.ext.log_data) >= expected:
-                    return
+                ends = [row[C_END] for row in self.ext.log_data]
             finally:
                 self.ext.data_lock.unlock()
+            if len(ends) >= expected and all(end != pending for end in ends):
+                return
             time.sleep(0.02)
-        self.fail('session logged %d/%d rows before timeout' %
-                  (len(self.ext.log_data), expected))
+        self.fail('session did not settle %d rows before timeout (have %d)' %
+                  (expected, len(self.ext.log_data)))
 
     def _confirm_yes(self):
         SAVER_LOGGER.JOptionPane.YES_OPTION = 0
@@ -896,7 +929,7 @@ class EndToEndSessionTest(unittest.TestCase):
 
     def _expected(self, master):
         """(serial, txn, per-URL request count) for each transaction, in
-        master (response) order."""
+        master (request-delivery) order."""
         counts = {}
         out = []
         for serial, txn in enumerate(master, start=1):
@@ -929,7 +962,7 @@ class EndToEndSessionTest(unittest.TestCase):
     def _assert_log_matches(self, master):
         """Every in-memory row, in order, one line at a time."""
         self.assertEqual(len(self.ext.log_data), len(master),
-                         'exactly one logged row per response')
+                         'exactly one logged row per request')
         for i, (serial, txn, count) in enumerate(self._expected(master)):
             self._assert_logged_row(self.ext.log_data[i], serial, txn, count)
 
@@ -989,31 +1022,32 @@ class EndToEndSessionTest(unittest.TestCase):
         phase_seq = bulk[0:15]       # simple back-to-back traffic
         phase_batched = bulk[15:39]  # concurrent batches, out-of-order responses
         phase_concurrent = bulk[39:63]  # everything in flight at once
-        # master response order == delivery order of the phases below
-        master = phase_seq + phase_batched + phase_concurrent + specials
 
         # Phase 1 + 2
         self._deliver(phase_seq, 'sequential')
         self._deliver(phase_batched, 'batched')
 
         # Mid-session checkpoint: a manual backup must capture, line for line,
-        # exactly what has been logged so far.
+        # exactly what has been logged so far. Rows are logged at request time,
+        # so serials follow request-delivery order (self._request_order).
         checkpoint = len(phase_seq) + len(phase_batched)
-        self._await_rows(checkpoint)
-        self._assert_log_matches(master[:checkpoint])
+        self._await_settled(checkpoint)
+        master_so_far = list(self._request_order)
+        self.assertEqual(len(master_so_far), checkpoint)
+        self._assert_log_matches(master_so_far)
         self.ext.backup_now(None)
         backups = [n for n in os.listdir(self.tmp)
                    if n.startswith('SAVER_LOGGER_BACKUP_')]
         self.assertEqual(len(backups), 1, 'Backup Now must write one file')
         self._assert_export_matches(os.path.join(self.tmp, backups[0]),
-                                    master[:checkpoint])
+                                    master_so_far)
 
         # Phase 3 + specials
         self._deliver(phase_concurrent, 'concurrent')
         self._deliver(specials, 'concurrent')
 
-        self._await_rows(len(master))
-        time.sleep(0.1)  # let the worker settle; no extra rows should appear
+        self._await_settled(len(self._request_order))
+        master = list(self._request_order)
 
         # Line-by-line verification of the entire in-memory log.
         self._assert_log_matches(master)
@@ -1049,14 +1083,16 @@ class EndToEndSessionTest(unittest.TestCase):
         self.assertEqual(read_raw(export_path), exported_session,
                          'exported file must be unchanged by a clear')
 
+        self._request_order = []  # track the fresh session on its own
         fresh = self._build_bulk(6)
         self._deliver(fresh, 'sequential')
-        self._await_rows(len(fresh))
-        self._assert_log_matches(fresh)  # serials restart at 1, counts fresh
+        self._await_settled(len(fresh))
+        fresh_master = list(self._request_order)
+        self._assert_log_matches(fresh_master)  # serials restart at 1, counts fresh
 
         fresh_path = os.path.join(self.tmp, 'fresh.csv')
         self.assertTrue(self.ext._write_full_csv(fresh_path))
-        self._assert_export_matches(fresh_path, fresh)
+        self._assert_export_matches(fresh_path, fresh_master)
 
 
 if __name__ == '__main__':
