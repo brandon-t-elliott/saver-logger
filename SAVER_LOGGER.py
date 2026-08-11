@@ -501,6 +501,21 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
             else:
                 JOptionPane.showMessageDialog(self.panel, "Export failed! Check console for errors.")
 
+    def _csv_field(self, value):
+        """
+        Encode one CSV field per RFC 4180 so field contents survive the
+        export unmodified, with spreadsheet formula-injection protection:
+        a field beginning with a formula trigger character is prefixed
+        with a single quote so Excel/LibreOffice treat it as text.
+        """
+        text = u"%s" % value
+        if len(text) > 1 and text[0] in (u'=', u'+', u'-', u'@', u'\t'):
+            text = u"'" + text
+        text = text.replace(u"\n", u" ").replace(u"\r", u" ")
+        if u',' in text or u'"' in text:
+            text = u'"' + text.replace(u'"', u'""') + u'"'
+        return text
+
     def _write_full_csv(self, filepath):
         """
         Write ALL log data to a single CSV file with complete column structure.
@@ -510,12 +525,14 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
         try:
             if not self.log_data:
                 return False
-            
+
             # Create a snapshot of the data
             data_snapshot = list(self.log_data)
         finally:
             self.data_lock.unlock()
 
+        fos = None
+        writer = None
         try:
             # Always overwrite with complete data (not append)
             fos = FileOutputStream(filepath, False)  # False = overwrite
@@ -526,25 +543,21 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
             writer.write("# Session ID: %s\n" % self.runtime_id)
             writer.write("# Export Time: %s\n" % datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
             writer.write("# Total Requests: %d\n\n" % len(data_snapshot))
-            
+
             # Column headers
             writer.write("Serial No,Host,Request Method,URL,Status Code,Tool Name,Request Count,Insertion Point Count,Start Time,End Time\n")
 
             # Write ALL data rows
             for row in data_snapshot:
-                # Sanitize data: replace commas, newlines, and carriage returns
-                safe = [str(col).replace(",", ";").replace("\n", " ").replace("\r", " ") for col in row]
-                writer.write(",".join(safe) + "\n")
+                writer.write(u",".join([self._csv_field(col) for col in row]) + u"\n")
 
             # Footer metadata for authenticity
             writer.write("\n# --- FOOTER METADATA ---\n")
-            writer.write("# Burp Suite Version: %s\n" % self._callbacks.getBurpVersion()[0])
+            writer.write("# Burp Suite Version: %s\n" % " ".join(self._callbacks.getBurpVersion()))
             writer.write("# Exported: %s\n" % datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
             writer.write("# Runtime ID: %s\n" % self.runtime_id)
             writer.write("# Total Requests Logged: %d\n" % len(data_snapshot))
 
-            writer.flush()
-            writer.close()
             return True
 
         except Exception as e:
@@ -552,6 +565,16 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
             import traceback
             traceback.print_exc()
             return False
+
+        finally:
+            # Close on every path; BufferedWriter.close() flushes first
+            try:
+                if writer is not None:
+                    writer.close()
+                elif fos is not None:
+                    fos.close()
+            except Exception:
+                pass
 
     def clear_logs(self, event):
         """Clear all logged data with confirmation"""
