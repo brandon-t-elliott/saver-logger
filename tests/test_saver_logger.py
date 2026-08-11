@@ -72,18 +72,19 @@ class MockMessage(object):
     response event, mirroring Burp's legacy IHttpListener behavior."""
 
     def __init__(self, url, host='ginandjuice.shop', method='GET',
-                 param_count=0, status=200):
+                 param_count=0, status=200, response_payload='RESPONSE-BYTES'):
         self.request_info = MockRequestInfo(url, method, param_count)
         self._status = status
         self._service = MockHttpService(host)
         self._responded = False
+        self._response_payload = response_payload
 
     def getRequest(self):
         return b'REQUEST-BYTES'
 
     def getResponse(self):
         if self._responded:
-            return ('RESPONSE-BYTES', self._status)
+            return (self._response_payload, self._status)
         return None
 
     def getHttpService(self):
@@ -95,6 +96,10 @@ class MockHelpers(object):
         return message.request_info
 
     def analyzeResponse(self, response_bytes):
+        # A response payload of 'MALFORMED' models bytes Burp cannot parse,
+        # exercising the extension's 'Error' status fallback.
+        if response_bytes[0] == 'MALFORMED':
+            raise ValueError('malformed response')
         return MockResponseInfo(response_bytes[1])
 
 
@@ -117,8 +122,15 @@ class MockCallbacks(object):
     def addSuiteTab(self, tab):
         pass
 
+    # Burp's ITool flag constants -> display names, so a simulated session
+    # can span multiple tools the way a real one does.
+    TOOL_NAMES = {
+        4: 'Proxy', 8: 'Spider', 16: 'Scanner', 32: 'Intruder',
+        64: 'Repeater', 128: 'Sequencer', 1024: 'Extender',
+    }
+
     def getToolName(self, flag):
-        return 'Proxy'
+        return self.TOOL_NAMES.get(flag, 'Extender')
 
     def getBurpVersion(self):
         return ['Burp Suite Professional', '2025', '.8.1']
@@ -182,6 +194,31 @@ class SaverLoggerTest(unittest.TestCase):
 
     def _rows_by_url(self):
         return dict((row[COL_URL], row) for row in self.ext.log_data)
+
+    def _confirm_yes(self):
+        """Make JOptionPane confirm dialogs auto-answer YES (headless)."""
+        SAVER_LOGGER.JOptionPane.YES_OPTION = 0
+        SAVER_LOGGER.JOptionPane.showConfirmDialog = staticmethod(lambda *a: 0)
+
+    def _restore_confirm(self):
+        for name in ('YES_OPTION', 'showConfirmDialog'):
+            if hasattr(SAVER_LOGGER.JOptionPane, name):
+                delattr(SAVER_LOGGER.JOptionPane, name)
+
+    def _drain_worker(self, expected_rows, timeout=8):
+        """Block until the background worker has logged expected_rows."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.ext.data_lock.lock()
+            try:
+                done = len(self.ext.log_data) >= expected_rows
+            finally:
+                self.ext.data_lock.unlock()
+            if done:
+                return
+            time.sleep(0.02)
+        self.fail('worker did not log %d rows in time (got %d)' %
+                  (expected_rows, len(self.ext.log_data)))
 
     # ---------- sanity ---------- #
 
@@ -494,22 +531,32 @@ class SaverLoggerTest(unittest.TestCase):
         self.assertIn('# Total Requests: 2',
                       read_raw(os.path.join(self.tmp, autosaves[0])))
 
-    def test_clear_logs_resets_all_state(self):
+    def test_clear_logs_resets_memory_but_keeps_exported_files(self):
         for i in range(2):
             msg = MockMessage('https://ginandjuice.shop/page/%d' % i)
             self.ext._handle_request(4, msg)
             self._respond(msg)
 
-        SAVER_LOGGER.JOptionPane.YES_OPTION = 0
-        SAVER_LOGGER.JOptionPane.showConfirmDialog = lambda *args: 0
+        # Export to disk before clearing; that file must survive the clear.
+        export_path = os.path.join(self.tmp, 'before_clear.csv')
+        self.assertTrue(self.ext._write_full_csv(export_path))
+        exported_before = read_raw(export_path)
+
+        self._confirm_yes()
         try:
             self.ext.clear_logs(None)
         finally:
-            del SAVER_LOGGER.JOptionPane.YES_OPTION
-            del SAVER_LOGGER.JOptionPane.showConfirmDialog
+            self._restore_confirm()
 
+        # In-memory state is reset...
         self.assertEqual(self.ext.log_data, [])
         self.assertEqual(self.ext.request_counter, 0)
+
+        # ...but the previously exported file is untouched on disk.
+        self.assertTrue(os.path.exists(export_path),
+                        'Clear Logs must not delete exported files')
+        self.assertEqual(read_raw(export_path), exported_before,
+                         'exported file contents must be unchanged by a clear')
 
         # Logging starts fresh after a clear
         msg = MockMessage('https://ginandjuice.shop/fresh')
@@ -561,6 +608,148 @@ class SaverLoggerTest(unittest.TestCase):
         path = os.path.join(self.ext.backup_folder, 'SAVER_LOGGER_AUTOSAVE.csv')
         self.assertTrue(os.path.exists(path),
                         'auto-backup must create the backup folder if missing')
+
+
+# Burp ITool flag constants used by the simulated session
+TOOL_PROXY = 4
+TOOL_SCANNER = 16
+TOOL_INTRUDER = 32
+TOOL_REPEATER = 64
+
+
+class EndToEndSessionTest(unittest.TestCase):
+    """Drive a realistic multi-tool Burp session through the real public
+    entry point (processHttpMessage -> queue -> background worker) and verify
+    that every message is logged and exported correctly.
+
+    The session mixes tools, sequential and concurrent in-flight requests,
+    out-of-order responses, repeated URLs, a comma-bearing URL, a dropped
+    connection (no response body), and an unparseable response. Because it
+    asserts correct correlation and CSV integrity, it is red on main and
+    green once all fix branches are applied - a single check that the whole
+    system works together.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='saver_logger_e2e_')
+        self.ext = SAVER_LOGGER.BurpExtender()
+        self.ext.registerExtenderCallbacks(MockCallbacks())
+        self.ext.backup_folder = self.tmp
+
+    def tearDown(self):
+        self.ext.shutdown_flag = True
+        if self.ext.worker_thread:
+            self.ext.worker_thread.join(2000)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _feed(self, events):
+        """Deliver (toolFlag, is_request, message) events in order, exactly
+        as Burp's IHttpListener would call the extension."""
+        for tool, is_request, msg in events:
+            self.ext.processHttpMessage(tool, is_request, msg)
+
+    def _await_rows(self, expected, timeout=8):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.ext.data_lock.lock()
+            try:
+                if len(self.ext.log_data) >= expected:
+                    return
+            finally:
+                self.ext.data_lock.unlock()
+            time.sleep(0.02)
+        self.fail('session logged %d/%d rows before timeout' %
+                  (len(self.ext.log_data), expected))
+
+    def test_full_session_is_logged_and_exported_correctly(self):
+        # --- build the messages of the session ---
+        p1 = MockMessage('https://ginandjuice.shop/home', method='GET',
+                         param_count=0, status=200)
+        p2 = MockMessage('https://ginandjuice.shop/home', method='GET',
+                         param_count=0, status=200)           # repeat of /home
+        r1 = MockMessage('https://ginandjuice.shop/login', method='POST',
+                         param_count=2, status=302)
+        r2 = MockMessage('https://ginandjuice.shop/login', method='POST',
+                         param_count=2, status=401)           # repeat of /login
+        s1 = MockMessage('https://ginandjuice.shop/search?q=1,2', method='GET',
+                         param_count=1, status=200)           # comma in URL
+        i1 = MockMessage('https://ginandjuice.shop/item?id=1', method='GET',
+                         param_count=1, status=500)
+        x1 = MockMessage('https://ginandjuice.shop/timeout', method='GET',
+                         param_count=0, status=200)           # dropped: no body
+        e1 = MockMessage('https://ginandjuice.shop/error', method='GET',
+                         param_count=1, status=200,
+                         response_payload='MALFORMED')        # unparseable
+
+        for msg in (p1, p2, r1, r2, s1, i1, x1, e1):
+            if msg is not x1:
+                msg._responded = True
+        e1._responded = True
+        x1._responded = False  # dropped connection: response event, empty body
+
+        # --- deliver events; response order is what assigns serial numbers ---
+        self._feed([
+            (TOOL_PROXY,    True,  p1), (TOOL_PROXY,    False, p1),
+            (TOOL_PROXY,    True,  p2), (TOOL_PROXY,    False, p2),
+            (TOOL_REPEATER, True,  r1),                        # r1, r2 in flight
+            (TOOL_REPEATER, True,  r2),
+            (TOOL_REPEATER, False, r1), (TOOL_REPEATER, False, r2),
+            (TOOL_SCANNER,  True,  s1),                        # s1, i1 in flight
+            (TOOL_INTRUDER, True,  i1),
+            (TOOL_INTRUDER, False, i1),                        # i1 responds first
+            (TOOL_SCANNER,  False, s1),                        # out of order
+            (TOOL_PROXY,    True,  x1), (TOOL_PROXY,    False, x1),
+            (TOOL_PROXY,    True,  e1), (TOOL_PROXY,    False, e1),
+        ])
+
+        self._await_rows(8)
+        # give the worker a beat to ensure nothing extra is appended
+        time.sleep(0.1)
+        self.assertEqual(len(self.ext.log_data), 8,
+                         'exactly one row per response event')
+
+        # --- export the whole session and read it back ---
+        export_path = os.path.join(self.tmp, 'session.csv')
+        self.assertTrue(self.ext._write_full_csv(export_path))
+        raw = read_raw(export_path)
+        self.assertIn('# Total Requests: 8', raw)
+        self.assertIn('# Total Requests Logged: 8', raw)
+
+        header, rows = read_csv_rows(export_path)
+        self.assertEqual(len(rows), 8)
+
+        # rows are keyed by serial number (col 0), assigned in response order
+        by_serial = dict((int(row[0]), row) for row in rows)
+        self.assertEqual(sorted(by_serial), [1, 2, 3, 4, 5, 6, 7, 8],
+                         'serials must be unique and contiguous 1..8')
+
+        # expected (Host, Method, URL, Status, Tool, ReqCount, InsertionPoints)
+        # in the exact order responses were delivered
+        expected = [
+            ('ginandjuice.shop', 'GET',  'https://ginandjuice.shop/home',        '200', 'Proxy',    '1', '0'),
+            ('ginandjuice.shop', 'GET',  'https://ginandjuice.shop/home',        '200', 'Proxy',    '2', '0'),
+            ('ginandjuice.shop', 'POST', 'https://ginandjuice.shop/login',       '302', 'Repeater', '1', '2'),
+            ('ginandjuice.shop', 'POST', 'https://ginandjuice.shop/login',       '401', 'Repeater', '2', '2'),
+            ('ginandjuice.shop', 'GET',  'https://ginandjuice.shop/item?id=1',   '500', 'Intruder', '1', '1'),
+            ('ginandjuice.shop', 'GET',  'https://ginandjuice.shop/search?q=1,2','200', 'Scanner',  '1', '1'),
+            ('ginandjuice.shop', 'GET',  'https://ginandjuice.shop/timeout',     '-',   'Proxy',    '1', '0'),
+            ('ginandjuice.shop', 'GET',  'https://ginandjuice.shop/error',       'Error','Proxy',   '1', '1'),
+        ]
+        timestamp = re.compile(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$')
+        for serial, want in enumerate(expected, start=1):
+            row = by_serial[serial]
+            host, method, url, status, tool, count, ip = want
+            self.assertEqual(row[1], host,   'row %d host' % serial)
+            self.assertEqual(row[2], method, 'row %d method' % serial)
+            self.assertEqual(row[3], url,    'row %d url (comma URL must survive)' % serial)
+            self.assertEqual(row[4], status, 'row %d status' % serial)
+            self.assertEqual(row[5], tool,   'row %d tool' % serial)
+            self.assertEqual(row[6], count,  'row %d request count' % serial)
+            self.assertEqual(row[7], ip,     'row %d insertion points' % serial)
+            self.assertTrue(timestamp.match(row[8]), 'row %d start time' % serial)
+            self.assertTrue(timestamp.match(row[9]), 'row %d end time' % serial)
+            self.assertLessEqual(row[8], row[9],
+                                 'row %d start must not be after end' % serial)
 
 
 if __name__ == '__main__':

@@ -43,8 +43,23 @@ extension's main behaviors: complete log-row metadata (all ten columns),
 serial-number ordering, the `-` and `Error` status fallbacks, CSV
 header/footer structure, empty-export handling, UTF-8 round-trips, manual
 `Backup Now`, auto-backup's single-overwritten-file contract, `Clear Logs`
-state reset, worker resilience to a malformed message, and backup-scheduler
+(which resets in-memory state but must leave already-exported files on disk
+untouched), worker resilience to a malformed message, and backup-scheduler
 interval/enable configuration.
+
+### End-to-end session test
+
+`EndToEndSessionTest.test_full_session_is_logged_and_exported_correctly`
+drives a realistic multi-tool Burp session entirely through the real public
+entry point (`processHttpMessage` -> queue -> background worker), then
+exports the session and reads the CSV back to verify every row. The session
+mixes Proxy/Repeater/Scanner/Intruder traffic, sequential and concurrent
+in-flight requests, out-of-order responses, repeated URLs, a comma-bearing
+URL, a dropped connection (`-` status), and an unparseable response
+(`Error` status). Because it asserts correct correlation and CSV integrity,
+it is **red on `main`** (row-4 insertion points come back `0` instead of
+`2`) and green only once every fix branch is applied — a single check that
+the whole system works together.
 
 ¹ Passes on `main` only as a side effect of the overwrite bug (the tracking
 dict never grows past ~1 entry because concurrent requests clobber the same
