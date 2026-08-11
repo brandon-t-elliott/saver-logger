@@ -7,7 +7,7 @@ from java.awt import BorderLayout, Dimension, Font, GridBagLayout, GridBagConstr
 from java.io import FileOutputStream, OutputStreamWriter, BufferedWriter, File
 from java.nio.charset import Charset
 from java.util import Timer, TimerTask, WeakHashMap
-from java.util.concurrent import locks
+from java.util.concurrent import locks, LinkedBlockingQueue, TimeUnit
 from java.lang import Thread, Runnable, System
 import datetime, os
 
@@ -25,6 +25,7 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
         # Thread-safe data storage with lock
         self.log_data = []
         self.request_counter = 0
+        self.url_request_counts = {}  # O(1) per-URL counts (guarded by data_lock)
         self.runtime_id = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
         self.data_lock = locks.ReentrantLock()  # Thread safety for log_data
         
@@ -42,9 +43,9 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
         self.backup_timer = None
         self.last_backup_time = 0  # Track last backup to prevent over-firing
 
-        # Processing queue and worker thread
-        self.processing_queue = []
-        self.queue_lock = locks.ReentrantLock()
+        # Processing queue and worker thread; the blocking queue does its
+        # own synchronization, no separate lock needed
+        self.processing_queue = LinkedBlockingQueue()
         self.worker_thread = None
         self.shutdown_flag = False
 
@@ -66,20 +67,12 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
             def run(self):
                 while not self.extender.shutdown_flag:
                     try:
-                        # Check if there's work to do
-                        work_item = None
-                        self.extender.queue_lock.lock()
-                        try:
-                            if len(self.extender.processing_queue) > 0:
-                                work_item = self.extender.processing_queue.pop(0)
-                        finally:
-                            self.extender.queue_lock.unlock()
-                        
-                        if work_item:
+                        # Block until work arrives; time out periodically so
+                        # the shutdown flag is rechecked
+                        work_item = self.extender.processing_queue.poll(
+                            500, TimeUnit.MILLISECONDS)
+                        if work_item is not None:
                             self.extender._process_request_data(work_item)
-                        else:
-                            # Sleep briefly if queue is empty
-                            Thread.sleep(100)
                     except Exception as e:
                         print("[SAVER_LOGGER] Worker thread error: %s" % str(e))
         
@@ -297,12 +290,8 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
             'message_info': messageInfo,
             'is_request': messageIsRequest
         }
-        
-        self.queue_lock.lock()
-        try:
-            self.processing_queue.append(work_item)
-        finally:
-            self.queue_lock.unlock()
+
+        self.processing_queue.put(work_item)
 
     def _handle_request(self, toolFlag, messageInfo):
         """Handle request in background thread"""
@@ -354,8 +343,10 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
             self.request_counter += 1
             current_id = self.request_counter
 
-            # Count how many times this URL has been requested
-            request_count = sum(1 for entry in self.log_data if entry[3] == url) + 1
+            # Count how many times this URL has been requested (O(1) instead
+            # of scanning the whole log on every response)
+            request_count = self.url_request_counts.get(url, 0) + 1
+            self.url_request_counts[url] = request_count
         finally:
             self.data_lock.unlock()
 
@@ -626,6 +617,7 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
                 cleared_count = len(self.log_data)
                 self.log_data = []
                 self.request_counter = 0
+                self.url_request_counts = {}
             finally:
                 self.data_lock.unlock()
             
@@ -668,13 +660,10 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
 
         # Process anything the worker had not gotten to, so the exit backup
         # includes messages queued right up to shutdown
-        self.queue_lock.lock()
-        try:
-            remaining = self.processing_queue
-            self.processing_queue = []
-        finally:
-            self.queue_lock.unlock()
-        for work_item in remaining:
+        while True:
+            work_item = self.processing_queue.poll(0, TimeUnit.MILLISECONDS)
+            if work_item is None:
+                break
             self._process_request_data(work_item)
 
         # Final backup on exit with timestamp
