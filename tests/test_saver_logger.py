@@ -17,6 +17,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -122,14 +123,23 @@ class MockCallbacks(object):
 
 
 class FakeClock(object):
-    """Deterministic replacement for the time module: advances 1s per call."""
+    """Deterministic replacement for the time module."""
 
-    def __init__(self, start=1000000.0):
+    def __init__(self, start=1000000.0, step=1.0):
         self.now = start
+        self.step = step
 
     def time(self):
-        self.now += 1.0
+        self.now += self.step
         return self.now
+
+
+class UnserializableField(object):
+    """A log cell whose string conversion fails, to force an export error
+    after the output stream is already open."""
+
+    def __str__(self):
+        raise ValueError('string conversion failed during export')
 
 
 # CSV row layout written by _write_full_csv
@@ -255,6 +265,48 @@ class SaverLoggerTest(unittest.TestCase):
             if original is not None:
                 SAVER_LOGGER.time = original
 
+    def test_tracking_dict_capped_under_burst(self):
+        """Demonstrates (against fix-request-correlation): a request burst
+        arriving faster than the stale-entry cutoff must still be bounded by
+        a hard size cap, since the tracking entries hold references to full
+        message objects.
+
+        Passes on main only via the overwrite bug (dict stays at ~1 entry);
+        red on the fix branch until its purge gains a size cap.
+        """
+        original = getattr(SAVER_LOGGER, 'time', None)
+        SAVER_LOGGER.time = FakeClock(step=0.01)  # 3000 requests in ~1 minute
+        try:
+            for i in range(3000):
+                msg = MockMessage('https://ginandjuice.shop/burst/%d' % i)
+                self.ext._handle_request(4, msg)
+            self.assertLessEqual(len(self.ext.request_tracking), 2000,
+                                 'tracking dict must be hard-capped even '
+                                 'when no entry is stale yet')
+        finally:
+            if original is not None:
+                SAVER_LOGGER.time = original
+
+    # ---------- queue / worker path ---------- #
+
+    def test_worker_processes_queued_messages_end_to_end(self):
+        """Characterization of the queue/worker path before the performance
+        rework: messages queued via processHttpMessage must be processed
+        into log rows by the background worker."""
+        msg = MockMessage('https://ginandjuice.shop/live', param_count=1)
+        self.ext.processHttpMessage(4, True, msg)
+        msg._responded = True
+        self.ext.processHttpMessage(4, False, msg)
+
+        deadline = time.time() + 5
+        while time.time() < deadline and not self.ext.log_data:
+            time.sleep(0.05)
+
+        self.assertEqual(len(self.ext.log_data), 1,
+                         'worker must drain the queue into log rows')
+        self.assertEqual(self.ext.log_data[0][COL_URL],
+                         'https://ginandjuice.shop/live')
+
     # ---------- CSV integrity (csv-integrity) ---------- #
 
     def test_csv_preserves_commas_in_fields(self):
@@ -276,18 +328,38 @@ class SaverLoggerTest(unittest.TestCase):
 
     def test_csv_formula_injection_neutralized(self):
         """Demonstrates: attacker-influenced fields must not be exported as
-        live spreadsheet formulas (CSV/formula injection)."""
-        row = list(SAMPLE_ROW)
-        row[COL_HOST] = '=2+5+cmd|calc'
-        self.ext.log_data.append(row)
+        live spreadsheet formulas (CSV/formula injection), for every
+        formula-trigger character spreadsheets honor."""
+        triggers = ['=', '+', '-', '@', '\t']
+        for index, trigger in enumerate(triggers):
+            row = list(SAMPLE_ROW)
+            row[0] = index + 1
+            row[COL_HOST] = trigger + 'HYPERLINK("https://ginandjuice.shop")'
+            self.ext.log_data.append(row)
         path = os.path.join(self.tmp, 'out.csv')
         self.assertTrue(self.ext._write_full_csv(path))
 
         _, rows = read_csv_rows(path)
-        cell = rows[0][COL_HOST]
-        self.assertFalse(cell.startswith(('=', '+', '@')),
-                         'exported cell must not begin with a formula trigger '
-                         'character: %r' % cell)
+        for trigger, row in zip(triggers, rows):
+            self.assertFalse(row[COL_HOST].startswith(trigger),
+                             'exported cell must not begin with formula '
+                             'trigger %r: got %r' % (trigger, row[COL_HOST]))
+
+    def test_export_failure_closes_file_handle(self):
+        """Demonstrates: when a write fails mid-export, _write_full_csv
+        returns False but leaves the output stream open; the handle must be
+        closed on all paths."""
+        java_stubs.BufferedWriter.instances = []
+        row = list(SAMPLE_ROW)
+        row[COL_URL] = UnserializableField()
+        self.ext.log_data.append(row)
+        path = os.path.join(self.tmp, 'export-failure.csv')
+
+        self.assertFalse(self.ext._write_full_csv(path))
+
+        self.assertEqual(len(java_stubs.BufferedWriter.instances), 1)
+        self.assertTrue(java_stubs.BufferedWriter.instances[0].closed,
+                        'export failure must still close the output stream')
 
     def test_csv_footer_records_burp_version(self):
         """Demonstrates: the footer writes getBurpVersion()[0], which is only

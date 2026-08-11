@@ -25,19 +25,24 @@ suite fails in exactly the places the fix branches address:
 |------|--------------------|-----------------|
 | `test_smoke_extension_loads` | pass | — (sanity) |
 | `test_per_url_request_count_increments` | pass | — (sanity) |
+| `test_worker_processes_queued_messages_end_to_end` | pass | — (characterization for `performance`) |
 | `test_concurrent_requests_keep_their_own_data` | **FAIL** | `fix-request-correlation` |
 | `test_out_of_order_responses_keep_their_own_data` | **FAIL** | `fix-request-correlation` |
 | `test_tracking_dict_stays_bounded` | pass¹ | `fix-request-correlation` |
+| `test_tracking_dict_capped_under_burst` | pass¹ | `fix-request-correlation` (size-cap hardening; **red on that branch** until it lands) |
 | `test_csv_preserves_commas_in_fields` | **FAIL** | `csv-integrity` |
 | `test_csv_formula_injection_neutralized` | **FAIL** | `csv-integrity` |
 | `test_csv_footer_records_burp_version` | **FAIL** | `csv-integrity` |
+| `test_export_failure_closes_file_handle` | **FAIL** | `csv-integrity` |
 | `test_unload_saves_queued_messages` | **FAIL** | `reliability-fixes` |
 | `test_auto_backup_survives_missing_folder` | **FAIL** | `reliability-fixes` |
 
-¹ Passes on `main` only as a side effect of the overwrite bug (the tracking
-dict never grows past ~1 entry because concurrent requests clobber the same
-key — the very defect the two correlation tests fail on). The test pins the
-bounded-memory property that the keyed design must maintain.
+¹ These pass on `main` only as a side effect of the overwrite bug (the
+tracking dict never grows past ~1 entry because concurrent requests clobber
+the same key — the very defect the two correlation tests fail on). They pin
+the bounded-memory properties that the keyed design must maintain: stale
+entries get purged, and a burst arriving faster than the stale cutoff is
+still size-capped.
 
 ## Testing a fix branch
 

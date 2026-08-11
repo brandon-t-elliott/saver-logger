@@ -207,8 +207,13 @@ class OutputStreamWriter(object):
 
 
 class BufferedWriter(object):
+    #: Every instance created, so tests can assert streams get closed.
+    instances = []
+
     def __init__(self, writer):
         self._file = writer._file
+        self.closed = False
+        BufferedWriter.instances.append(self)
 
     def write(self, text):
         self._file.write(text.encode('utf-8'))
@@ -217,6 +222,7 @@ class BufferedWriter(object):
         self._file.flush()
 
     def close(self):
+        self.closed = True
         self._file.close()
 
 
