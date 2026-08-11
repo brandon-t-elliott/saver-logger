@@ -37,6 +37,15 @@ suite fails in exactly the places the fix branches address:
 | `test_unload_saves_queued_messages` | **FAIL** | `reliability-fixes` |
 | `test_auto_backup_survives_missing_folder` | **FAIL** | `reliability-fixes` |
 
+In addition to the bug-demonstration tests above, the suite carries twelve
+functional characterization tests that pass on every branch and pin the
+extension's main behaviors: complete log-row metadata (all ten columns),
+serial-number ordering, the `-` and `Error` status fallbacks, CSV
+header/footer structure, empty-export handling, UTF-8 round-trips, manual
+`Backup Now`, auto-backup's single-overwritten-file contract, `Clear Logs`
+state reset, worker resilience to a malformed message, and backup-scheduler
+interval/enable configuration.
+
 ¹ Passes on `main` only as a side effect of the overwrite bug (the tracking
 dict never grows past ~1 entry because concurrent requests clobber the same
 key — the very defect the correlation tests fail on). Together with the
