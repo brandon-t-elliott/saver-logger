@@ -9,7 +9,7 @@ from java.nio.charset import Charset
 from java.util import Timer, TimerTask
 from java.util.concurrent import locks
 from java.lang import Thread, Runnable
-import datetime, os
+import datetime, os, time
 
 
 class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
@@ -314,25 +314,33 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
         
         # Track request start time
         start_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
-        # Get next request ID (thread-safe)
-        self.data_lock.lock()
-        try:
-            req_id = self.request_counter + 1
-        finally:
-            self.data_lock.unlock()
-        
-        # Store tracking entry (thread-safe)
+
+        # Key tracking by the message object itself so responses are matched to
+        # their own request even when multiple requests are in flight at once.
         self.tracking_lock.lock()
         try:
-            self.request_tracking[req_id] = {
+            self._purge_stale_tracking()
+            self.request_tracking[messageInfo] = {
                 'start_time': start_time,
-                'end_time': None,
+                'created': time.time(),
                 'insertion_points': int(insertion_point_count),
                 'url': url
             }
         finally:
             self.tracking_lock.unlock()
+
+    def _purge_stale_tracking(self):
+        """
+        Drop tracking entries whose response never arrived (dropped connections,
+        cancelled requests) so the dict cannot grow without bound.
+        Must be called with tracking_lock held.
+        """
+        if len(self.request_tracking) < 1000:
+            return
+        cutoff = time.time() - 300
+        for key in list(self.request_tracking.keys()):
+            if self.request_tracking[key]['created'] < cutoff:
+                del self.request_tracking[key]
 
     def _handle_response(self, toolFlag, messageInfo):
         """Handle response in background thread"""
@@ -358,24 +366,28 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
         try:
             self.request_counter += 1
             current_id = self.request_counter
-            
+
             # Count how many times this URL has been requested
             request_count = sum(1 for entry in self.log_data if entry[3] == url) + 1
         finally:
             self.data_lock.unlock()
-        
-        # Get tracking data (thread-safe)
+
+        # Match this response to its own request via the message object
         self.tracking_lock.lock()
         try:
-            tracking = self.request_tracking.get(current_id, {})
-            start_time = tracking.get('start_time', end_time)
-            insertion_points = tracking.get('insertion_points', 0)
-            
-            # Clean up tracking data
-            if current_id in self.request_tracking:
-                del self.request_tracking[current_id]
+            tracking = self.request_tracking.pop(messageInfo, None)
         finally:
             self.tracking_lock.unlock()
+
+        if tracking is not None:
+            start_time = tracking['start_time']
+            insertion_points = tracking['insertion_points']
+        else:
+            # Request event was missed (or Burp delivered the response on a
+            # different message object): analyze the request now instead of
+            # attaching another request's data to this row.
+            start_time = end_time
+            insertion_points = self._count_insertion_points(req, messageInfo.getRequest(), tool)
         
         # Store complete log entry (thread-safe)
         self.data_lock.lock()
