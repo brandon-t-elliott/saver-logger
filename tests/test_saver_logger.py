@@ -144,6 +144,22 @@ class UnserializableField(object):
         raise ValueError('string conversion failed during export')
 
 
+class CountingLock(object):
+    """Wraps a lock and counts acquisitions, so a test can assert how many
+    separate lock holds a method takes."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.acquires = 0
+
+    def lock(self):
+        self.acquires += 1
+        self.inner.lock()
+
+    def unlock(self):
+        self.inner.unlock()
+
+
 # CSV row layout written by _write_full_csv
 COL_HOST = 1
 COL_URL = 3
@@ -204,6 +220,19 @@ class SaverLoggerTest(unittest.TestCase):
         for name in ('YES_OPTION', 'showConfirmDialog'):
             if hasattr(SAVER_LOGGER.JOptionPane, name):
                 delattr(SAVER_LOGGER.JOptionPane, name)
+
+    def _capture_dialogs(self):
+        """Record the text of JOptionPane.showMessageDialog calls."""
+        self._dialogs = []
+        SAVER_LOGGER.JOptionPane.showMessageDialog = staticmethod(
+            lambda panel, message, *a: self._dialogs.append(message))
+
+    def _restore_dialogs(self):
+        if hasattr(SAVER_LOGGER.JOptionPane, 'showMessageDialog'):
+            try:
+                delattr(SAVER_LOGGER.JOptionPane, 'showMessageDialog')
+            except AttributeError:
+                pass
 
     def _drain_worker(self, expected_rows, timeout=8):
         """Block until the background worker has logged expected_rows."""
@@ -420,6 +449,63 @@ class SaverLoggerTest(unittest.TestCase):
                         'exit backup must include messages still in the queue')
         content = read_raw(os.path.join(self.tmp, backups[0]))
         self.assertIn('https://ginandjuice.shop/tail', content)
+
+    # ---------- concurrency / robustness fixes ---------- #
+
+    def test_handle_response_appends_row_under_single_lock(self):
+        """Demonstrates: the serial increment and the row append must happen
+        under one data_lock hold, so a concurrent Clear Logs cannot run
+        between them and orphan a row with a stale serial number.
+        """
+        spy = CountingLock(self.ext.data_lock)
+        self.ext.data_lock = spy
+
+        msg = MockMessage('https://ginandjuice.shop/atomic', param_count=1)
+        self.ext._handle_request(4, msg)
+        spy.acquires = 0  # count only the response handling
+        msg._responded = True
+        self.ext._handle_response(4, msg)
+
+        self.assertEqual(spy.acquires, 1,
+                         'serial assignment and row append must be a single '
+                         'atomic data_lock section')
+        self.assertEqual(len(self.ext.log_data), 1)
+        self.assertEqual(self.ext.log_data[0][0], 1)
+
+    def test_response_without_matching_request_uses_fallback(self):
+        """A response with no prior request event is still logged, with
+        insertion points recomputed from the request and start time falling
+        back to the end time - never another request's data."""
+        msg = MockMessage('https://ginandjuice.shop/orphan', param_count=3,
+                           status=200)
+        msg._responded = True
+        self.ext._handle_response(4, msg)  # no _handle_request first
+
+        self.assertEqual(len(self.ext.log_data), 1)
+        row = self.ext.log_data[0]
+        self.assertEqual(row[COL_INSERTION_POINTS], 3,
+                         'insertion points must be recomputed from the request')
+        self.assertEqual(row[8], row[9],
+                         'start time falls back to end time when unmatched')
+
+    def test_backup_now_with_no_data_reports_no_data(self):
+        """Demonstrates: Backup Now with an empty log must say there is no
+        data, not report a false 'Backup failed' error, and must not write a
+        file."""
+        self._capture_dialogs()
+        try:
+            self.ext.backup_now(None)
+        finally:
+            self._restore_dialogs()
+
+        joined = ' '.join(self._dialogs).lower()
+        self.assertIn('no data', joined,
+                      'empty backup must report no data: %r' % self._dialogs)
+        self.assertNotIn('failed', joined,
+                         'empty backup must not report a failure: %r' % self._dialogs)
+        backups = [n for n in os.listdir(self.tmp)
+                   if n.startswith('SAVER_LOGGER_BACKUP_')]
+        self.assertEqual(backups, [], 'no file should be written with no data')
 
     # ---------- functional coverage (characterization; pass on every branch) ---------- #
 

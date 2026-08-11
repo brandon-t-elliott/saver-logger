@@ -337,19 +337,6 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
         tool = self._callbacks.getToolName(toolFlag)
         end_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-        # Thread-safe increment and get
-        self.data_lock.lock()
-        try:
-            self.request_counter += 1
-            current_id = self.request_counter
-
-            # Count how many times this URL has been requested (O(1) instead
-            # of scanning the whole log on every response)
-            request_count = self.url_request_counts.get(url, 0) + 1
-            self.url_request_counts[url] = request_count
-        finally:
-            self.data_lock.unlock()
-
         # Match this response to its own request via the message object
         self.tracking_lock.lock()
         try:
@@ -366,10 +353,21 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
             # attaching another request's data to this row.
             start_time = end_time
             insertion_points = self._count_insertion_points(req, messageInfo.getRequest(), tool)
-        
-        # Store complete log entry (thread-safe)
+
+        # Assign the serial, bump the per-URL count, and append the row under
+        # a SINGLE data_lock hold. Splitting these across separate locks would
+        # let a concurrent clear_logs run in the gap and orphan a row with a
+        # stale serial number in a just-cleared log.
         self.data_lock.lock()
         try:
+            self.request_counter += 1
+            current_id = self.request_counter
+
+            # Count how many times this URL has been requested (O(1) instead
+            # of scanning the whole log on every response)
+            request_count = self.url_request_counts.get(url, 0) + 1
+            self.url_request_counts[url] = request_count
+
             self.log_data.append([
                 current_id,                 # Serial No
                 host,                       # Host
@@ -426,6 +424,16 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
 
     def backup_now(self, event):
         """Manual backup button - saves to configured backup folder with timestamp"""
+        self.data_lock.lock()
+        try:
+            has_data = len(self.log_data) > 0
+        finally:
+            self.data_lock.unlock()
+
+        if not has_data:
+            JOptionPane.showMessageDialog(self.panel, "No data to back up!")
+            return
+
         if not self._ensure_backup_folder(self.backup_folder):
             JOptionPane.showMessageDialog(self.panel,
                                           "Backup failed! Folder unavailable:\n%s" % self.backup_folder)
@@ -648,23 +656,32 @@ class BurpExtender(IBurpExtender, IHttpListener, IExtensionStateListener, ITab):
         """
         # Shutdown worker thread
         self.shutdown_flag = True
+        worker_stopped = True
         if self.worker_thread:
             try:
                 self.worker_thread.join(5000)  # Wait up to 5 seconds
             except:
                 pass
-        
+            try:
+                worker_stopped = not self.worker_thread.isAlive()
+            except:
+                worker_stopped = True
+
         # Cancel backup timer
         if self.backup_timer:
             self.backup_timer.cancel()
 
-        # Process anything the worker had not gotten to, so the exit backup
-        # includes messages queued right up to shutdown
-        while True:
-            work_item = self.processing_queue.poll(0, TimeUnit.MILLISECONDS)
-            if work_item is None:
-                break
-            self._process_request_data(work_item)
+        # Drain anything the worker had not gotten to so the exit backup
+        # includes messages queued right up to shutdown. Only drain once the
+        # worker has actually stopped, so this is the sole consumer of the
+        # queue and never races the worker.
+        if worker_stopped:
+            drain = lambda: self.processing_queue.poll(0, TimeUnit.MILLISECONDS)
+            for work_item in iter(drain, None):
+                self._process_request_data(work_item)
+        else:
+            print("[SAVER_LOGGER] Worker still active at unload; "
+                  "some queued messages may be unprocessed")
 
         # Final backup on exit with timestamp
         self.data_lock.lock()
